@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package peer_proto;
+
+service Peer {
+    rpc HeartBeat(HeartBeatReq) returns (HeartBeatRes);
+}
+
+message ReqHeader {
+    int32 version = 1;
+    int64 seqid = 3;
+}
+
+message ResHeader {
+    int64 seqid = 1;
+    int32 ret_code = 2;
+    string ret_msg = 4;
+}
+
+message HeartBeatReq {
+    ReqHeader header = 1;
+}
+
+message HeartBeatRes {
+    ResHeader header = 1;
+}
