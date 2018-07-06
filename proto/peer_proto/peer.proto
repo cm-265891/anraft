@@ -6,6 +6,12 @@ service Peer {
     rpc HeartBeat(HeartBeatReq) returns (HeartBeatRes);
 }
 
+enum PeerState {
+    Follower = 0;
+    Candidate = 1;
+    Leader = 2;
+}
+
 message ReqHeader {
     int32 version = 1;
     int64 seqid = 3;
