@@ -155,6 +155,7 @@ func (p *PeerServer) RoleManageThd() {
 }
 
 func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *AppendEntryOutput {
+	return nil
 }
 
 func (p *PeerServer) FollowerCron() {
@@ -166,9 +167,9 @@ func (p *PeerServer) FollowerCron() {
 		case <-time.After(p.election_timeout):
 			p.ElecTimeout()
 			return
+		case tmp := <-p.new_entry_pair.input:
+			p.new_entry_pair.output <- p.appendNewEntries(tmp)
 		}
-        case tmp := <-new_entry_pair.input:
-            new_entry_pair.output <- p.appendNewEntries(tmp)
 	}
 }
 
