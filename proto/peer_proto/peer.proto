@@ -4,6 +4,8 @@ package peer_proto;
 
 service Peer {
     rpc HeartBeat(HeartBeatReq) returns (HeartBeatRes);
+    rpc RequestVote(RequestVoteReq) returns (RequestVoteRes);
+    rpc AppendEntries(AppendEntriesReq) returns (AppendEntriesRes);
 }
 
 enum PeerState {
@@ -29,4 +31,34 @@ message HeartBeatReq {
 
 message HeartBeatRes {
     ResHeader header = 1;
+}
+
+message RequestVoteReq {
+    ReqHeader header = 1;
+    int64 term = 2;
+    string candidate_id = 3;
+    int64 last_log_index = 4;
+    int64 last_log_term = 5;
+}
+
+message RequestVoteRes {
+    ResHeader header = 1;
+    int64 term = 2;
+    string vote_granted = 3;
+}
+
+message AppendEntriesReq {
+    ReqHeader header = 1;
+    int64 term = 2;
+    string leader_id = 3;
+    int64 prev_log_index = 4;
+    int64 prev_log_term = 5;
+    repeated string entries = 6;
+    int64 leader_commit = 7;
+}
+
+message AppendEntriesRes {
+    ResHeader header = 1;
+    int64 term = 2;
+    int32 success = 3;
 }

@@ -30,5 +30,3 @@ func FileExist(path string) (bool, error) {
     }
     return true, err
 }
-
-func 
