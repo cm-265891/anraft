@@ -12,6 +12,33 @@ import (
 	"time"
 )
 
+/************************************************************************************
+                        +---------------------------------------------------------+
+                        |                            RoleMaintain Loop            |
+                        |                                                         |
+                        |                          +--------------------------+   |
+                        |                          |   Leader  Loop           |   |
+                        |                    +-----|                          |   |
+                        |                    |     +--------------------------+   |
+     +-----------+      |      +----------+  |     +--------------------------+   |
+     | Rpc       |-------------| Pipe Pair|--|-----|   Follower Loop          |   |
+     +-----------+      |      +----------+  |     |                          |   |
+                        |                    |     +--------------------------+   |
+                        |                    |     +--------------------------+   |
+                        |                    +-----|   Candidate Loop         |   |
+                        |                          |                          |   |
+                        |                          +--------------------------+   |
+                        |                                                         |
+                        +---------------------------------------------------------+
+
+NOTE(deyukong): the thread model is above, meta changing is processed only in
+RoleMaintain loop(thread), a rpc(like appendentry) from other threads may require
+synchronous process. It passes params through new_entry_pair.input and wait on
+new_entry_pair.output. Three sub-loops in RoleMaintain loop transfers between each
+other with roles. but they are in one thread, so new_entry_pair is handled without
+race problems.
+***********************************************************************************/
+
 // appendEntry result
 type AeResult int
 
@@ -28,8 +55,9 @@ type PeerInfo struct {
 }
 
 type AppendEntryOutput struct {
-	err AeResult
-	msg string
+	err  AeResult
+	msg  string
+	term int64
 }
 
 type NewEntryPair struct {
@@ -126,6 +154,9 @@ func (p *PeerServer) RoleManageThd() {
 	}
 }
 
+func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *AppendEntryOutput {
+}
+
 func (p *PeerServer) FollowerCron() {
 	for {
 		select {
@@ -136,6 +167,8 @@ func (p *PeerServer) FollowerCron() {
 			p.ElecTimeout()
 			return
 		}
+        case tmp := <-new_entry_pair.input:
+            new_entry_pair.output <- p.appendNewEntries(tmp)
 	}
 }
 
@@ -193,28 +226,6 @@ func (p *PeerServer) RequestVote(context.Context, *pb.RequestVoteReq) (*pb.Reque
 	return nil, nil
 }
 
-func (p *PeerServer) appendEntry(e int, term int64) error {
-	// see paper chaptor-5.2 a candidate may receive an appendEntry rpc from another server
-	// chaiming to be leader, if ......,, candidate returns to follower state
-	// NOTE(deyukong): in fact, it does not harm correctness, only makes election not aggresive
-	// it is an optimization, but makes things more complex
-	now_term := p.GetTerm()
-
-	if term < now_term {
-		return nil
-	}
-
-	p.new_entry_chan[0] <- term
-	state := <-p.new_entry_chan[1]
-	if state == 0 {
-		return nil
-	} else if state == 1 { // TODO: try again
-		return nil
-	} else {
-		return nil
-	}
-}
-
 func (p *PeerServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq) (*pb.AppendEntriesRes, error) {
 	now_term := p.GetTerm()
 	rsp := new(pb.AppendEntriesRes)
@@ -224,7 +235,21 @@ func (p *PeerServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq
 		rsp.Success = 0
 		return rsp, nil
 	}
-	return nil, nil
+	p.new_entry_pair.input <- req
+	pipe_output := <-p.new_entry_pair.output
+	if pipe_output.err == AE_RETRY {
+		log.Infof("appendEntry with term:%d retries", req.Term)
+		return p.AppendEntries(ctx, req)
+	}
+	if pipe_output.err == AE_ERR {
+		log.Errorf("appendEntry term:%d failed with info:%s", req.Term, pipe_output.msg)
+		rsp.Term = pipe_output.term
+		rsp.Success = 0
+	} else {
+		rsp.Term = pipe_output.term
+		rsp.Success = 1
+	}
+	return rsp, nil
 }
 
 func (p *PeerServer) VoteForSelf(channel chan *pb.RequestVoteRes) int64 {
@@ -312,16 +337,18 @@ func (p *PeerServer) Elect() {
 			if new_term > tmp.Term {
 				log.Infof("elect term:%d got entry with smaller term:%d, keep wait", new_term, tmp.Term)
 				p.new_entry_pair.output <- &AppendEntryOutput{
-					err: AE_ERR,
-					msg: fmt.Sprintf("reqterm:%d smaller than candidate:%d", tmp.Term, new_term),
+					err:  AE_ERR,
+					msg:  fmt.Sprintf("reqterm:%d smaller than candidate:%d", tmp.Term, new_term),
+					term: new_term,
 				}
 			} else {
 				log.Infof("elect term:%d got monotonic term:%d, turn to follower", new_term, tmp.Term)
 				p.UpdateTerm(tmp.Term)
 				p.ChangeState(pb.PeerState_Follower)
 				p.new_entry_pair.output <- &AppendEntryOutput{
-					err: AE_RETRY,
-					msg: "",
+					err:  AE_RETRY,
+					msg:  "",
+					term: tmp.Term,
 				}
 				return
 			}
@@ -387,16 +414,18 @@ WAIT_ELECT_FOR_END:
 				if new_term > tmp.Term {
 					log.Infof("elect term:%d got entry with smaller term:%d, keep wait", new_term, tmp.Term)
 					p.new_entry_pair.output <- &AppendEntryOutput{
-						err: AE_ERR,
-						msg: fmt.Sprintf("reqterm:%d smaller than candidate:%d", tmp.Term, new_term),
+						err:  AE_ERR,
+						msg:  fmt.Sprintf("reqterm:%d smaller than candidate:%d", tmp.Term, new_term),
+						term: new_term,
 					}
 				} else {
 					log.Infof("elect term:%d got entry with monotonic term:%d, turn follower", new_term, tmp.Term)
 					p.UpdateTerm(tmp.Term)
 					p.ChangeState(pb.PeerState_Follower)
 					p.new_entry_pair.output <- &AppendEntryOutput{
-						err: AE_RETRY,
-						msg: "",
+						err:  AE_RETRY,
+						msg:  "",
+						term: tmp.Term,
 					}
 					return
 				}
