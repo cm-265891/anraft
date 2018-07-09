@@ -18,12 +18,17 @@ type PeerStorage struct {
 
 // NOTE(deyukong): It's confusion to handle endians, so I convert nums to strings with preceding zeros
 func (p *PeerStorage) SaveTerm(term int64) error {
-    key := fmt.Sprintf("%03d|TERM", META)
+    key := fmt.Sprintf("%03d|CURRENT_TERM", META)
     val := fmt.Sprintf("%d", term)
     return p.engine.Set([]byte(key), []byte(val))
 }
 
 func (p *PeerStorage) SaveVoteFor(vote_for string) error {
-    key := fmt.Sprintf("%03d|VOTEFOR", META)
+    key := fmt.Sprintf("%03d|VOTE_FOR", META)
     return p.engine.Set([]byte(key), []byte(vote_for))
+}
+
+func (p *PeerStorage) SeekLogAt(index int64) storage.Iterator {
+    key := fmt.Sprintf("%03d|%021d", LOG, index)
+    return p.engine.Seek([]byte(key))
 }

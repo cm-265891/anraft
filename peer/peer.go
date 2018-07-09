@@ -45,7 +45,12 @@ type AeResult int
 const (
 	AE_OK AeResult = iota
 	AE_RETRY
-	AE_ERR
+	AE_SMALL_TERM
+    AE_LAG_MAX
+)
+
+const (
+    LAG_MAX = 1000
 )
 
 type PeerInfo struct {
@@ -93,7 +98,7 @@ type PeerServer struct {
 	// in-mem cache of the in-disk persistent vote_for, protected by mutex
 	vote_for       string
 	state          pb.PeerState
-	store          storage.Storage
+	store          *peer.PeerStorage
 	new_entry_pair *NewEntryPair
 	new_entry_chan []chan int64
 	close_chan     chan int
@@ -155,7 +160,40 @@ func (p *PeerServer) RoleManageThd() {
 }
 
 func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *AppendEntryOutput {
-	return nil
+    // it's the upper logic's duty to guarantee the correct role at this point
+    if p.state != pb.PeerState_Follower {
+        log.Fatalf("append entry but role[%v] not follower", p.state)
+    }
+    if entries.PrevLogIndex < 0 {
+        cursor := p.store.SeekLogAt(0)
+        defer cursor.Close()
+        cnt := 0
+        for {
+            entry, err := cursor.Next()
+            if err != nil {
+                log.Fatalf("iter cursor failed:%v", err)
+            }
+            if entry != nil {
+                cnt += 1
+            } else {
+                break
+            }
+            if cnt >= LAG_MAX {
+                break
+            }
+        }
+        if cnt >= LAG_MAX {
+            log.Errorf("appendEntries lag too far")
+            return &AppendEntryOutput {
+                err : Ae
+            }
+	err  AeResult
+	msg  string
+	term int64
+
+            return 
+        }
+    }
 }
 
 func (p *PeerServer) FollowerCron() {
@@ -199,12 +237,12 @@ func (p *PeerServer) updateTermInLock(new_term int64) error {
 	}
 	p.current_term = new_term
 	termbytes := []byte(fmt.Sprintf("%d", p.current_term))
-	if err := p.store.Set("current_term", termbytes); err != nil {
+	if err := p.store.SaveTerm(termbytes); err != nil {
 		return err
 	}
 	p.vote_for = ""
 	votebytes := []byte(fmt.Sprintf("%s", p.vote_for))
-	if err := p.store.Set("vote_for", votebytes); err != nil {
+	if err := p.store.SaveVoteFor(votebytes); err != nil {
 		return err
 	}
 	return nil
@@ -217,7 +255,7 @@ func (p *PeerServer) voteInLock(id string) error {
 	}
 	p.vote_for = id
 	votebytes := []byte(fmt.Sprintf("%s", p.vote_for))
-	if err := p.store.Set("vote_for", votebytes); err != nil {
+	if err := p.store.SaveVoteFor(votebytes); err != nil {
 		return err
 	}
 	return nil
