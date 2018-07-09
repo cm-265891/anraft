@@ -46,11 +46,11 @@ const (
 	AE_OK AeResult = iota
 	AE_RETRY
 	AE_SMALL_TERM
-    AE_LAG_MAX
+	AE_TERM_UNMATCH
 )
 
 const (
-    LAG_MAX = 1000
+	LAG_MAX = 1000
 )
 
 type PeerInfo struct {
@@ -67,7 +67,7 @@ type AppendEntryOutput struct {
 
 type NewEntryPair struct {
 	input  chan *pb.AppendEntriesReq
-	output chan *AppendEntryOutput
+	output chan *pb.AppendEntriesRes
 }
 
 func (p *PeerInfo) Init(id string, host string) error {
@@ -98,7 +98,7 @@ type PeerServer struct {
 	// in-mem cache of the in-disk persistent vote_for, protected by mutex
 	vote_for       string
 	state          pb.PeerState
-	store          *peer.PeerStorage
+	store          *PeerStorage
 	new_entry_pair *NewEntryPair
 	new_entry_chan []chan int64
 	close_chan     chan int
@@ -131,7 +131,7 @@ func (p *PeerServer) Init(my_id, my_host string, hosts map[string]string) error 
 	p.state = pb.PeerState_Follower
 	p.new_entry_pair = &NewEntryPair{
 		input:  make(chan *pb.AppendEntriesReq),
-		output: make(chan *AppendEntryOutput),
+		output: make(chan *pb.AppendEntriesRes),
 	}
 	// TODO(deyukong): make full init
 	go p.RoleManageThd()
@@ -159,41 +159,108 @@ func (p *PeerServer) RoleManageThd() {
 	}
 }
 
-func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *AppendEntryOutput {
-    // it's the upper logic's duty to guarantee the correct role at this point
-    if p.state != pb.PeerState_Follower {
-        log.Fatalf("append entry but role[%v] not follower", p.state)
-    }
-    if entries.PrevLogIndex < 0 {
-        cursor := p.store.SeekLogAt(0)
-        defer cursor.Close()
-        cnt := 0
-        for {
-            entry, err := cursor.Next()
-            if err != nil {
-                log.Fatalf("iter cursor failed:%v", err)
-            }
-            if entry != nil {
-                cnt += 1
-            } else {
-                break
-            }
-            if cnt >= LAG_MAX {
-                break
-            }
-        }
-        if cnt >= LAG_MAX {
-            log.Errorf("appendEntries lag too far")
-            return &AppendEntryOutput {
-                err : Ae
-            }
-	err  AeResult
-	msg  string
-	term int64
+func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEntriesRes {
+	// it's the upper logic's duty to guarantee the correct role at this point
+	if p.state != pb.PeerState_Follower {
+		log.Fatalf("append entry but role[%v] not follower", p.state)
+	}
+	if p.current_term != entries.Term {
+		log.Fatalf("append entry but term[%d:%d] not match", p.current_term, entries.Term)
+	}
 
-            return 
-        }
-    }
+	var iter storage.Iterator = nil
+	if entries.PrevLogIndex == -1 {
+		// NOTE(deyukong): currently, committed logs are not archieved, so seek from 0
+		iter = p.store.SeekLogAt(0)
+		defer iter.Close()
+	} else {
+		iter = p.store.SeekLogAt(entries.PrevLogIndex)
+		defer iter.Close()
+
+		// seek to the end
+		if !iter.ValidForPrefix(LOG_PREFIX) {
+			return &pb.AppendEntriesRes{
+				Header: new(pb.ResHeader),
+				Term:   entries.Term,
+				Result: int32(AE_TERM_UNMATCH),
+			}
+		}
+		entry, err := IterEntry2Log(iter)
+		if err != nil {
+			log.Fatalf("idx:%d parse rawlog to logentry failed:%v", entries.PrevLogIndex, err)
+		}
+		// entry not match
+		if entry.Term != entries.PrevLogTerm {
+			log.Warnf("master[%s] entry:[%d:%d] not match mine[%d:%d]",
+				entries.LeaderId, entries.PrevLogIndex, entries.PrevLogTerm, entry.Index, entry.Term)
+			return &pb.AppendEntriesRes{
+				Header: new(pb.ResHeader),
+				Term:   entries.Term,
+				Result: int32(AE_TERM_UNMATCH),
+			}
+		}
+		// prev_entry matches, move iter to the next
+		iter.Next()
+	}
+
+	// at most times, code reaches here with iter invalid
+	if iter.ValidForPrefix(LOG_PREFIX) {
+		log.Warnf("master[%s] replays old log:[%d:%d]",
+			entries.LeaderId, entries.PrevLogIndex, entries.PrevLogTerm)
+	}
+
+	// set apply_from default to len(entries.Entries), if all matches, we have nothing to apply
+	apply_from := len(entries.Entries)
+	for idx, master_entry := range entries.Entries {
+		// seek to the end
+		if !iter.ValidForPrefix(LOG_PREFIX) {
+			apply_from = idx
+			break
+		}
+		entry, err := IterEntry2Log(iter)
+		if err != nil {
+			// NOTE(deyukong): master_entry.Index is not mine, but it should be the same,
+			// just for problem-tracking
+			log.Fatalf("idx:%d parse rawlog to logentry failed:%v", master_entry.Index, err)
+		}
+		if entry.Index != master_entry.Index {
+			log.Fatalf("bug:master[%s] entry:[%d:%d] index defers from  mine[%d:%d]",
+				entries.LeaderId, entries.PrevLogIndex, entries.PrevLogTerm, entry.Index, entry.Term)
+		}
+		if entry.Term != master_entry.Term {
+			apply_from = idx
+			break
+		}
+		// entry.Term == master_entry.Term
+		iter.Next()
+	}
+
+	// at most times, code reaches here with iter invalid
+	for ; iter.ValidForPrefix(LOG_PREFIX); iter.Next() {
+		entry, err := IterEntry2Log(iter)
+		if err != nil {
+			log.Fatalf("logentry parse failed:%v", err)
+		}
+		if err := p.store.DelLogEntry(entry); err != nil {
+			log.Fatalf("del logentry:%v failed:%v", entry, err)
+		} else {
+			log.Infof("logentry:%v remove succ", entry)
+		}
+	}
+
+	for i := apply_from; i < len(entries.Entries); i++ {
+		if err := p.store.AppendLogEntry(entries.Entries[i]); err != nil {
+			log.Fatalf("apply entry:%v to store failed:%v", entries.Entries[i], err)
+		} else {
+			log.Infof("apply entry:%v to store success", entries.Entries[i])
+		}
+	}
+
+	return &pb.AppendEntriesRes{
+		Header: new(pb.ResHeader),
+		Term:   entries.Term,
+		Result: int32(AE_OK),
+	}
 }
 
 func (p *PeerServer) FollowerCron() {
@@ -236,13 +303,11 @@ func (p *PeerServer) updateTermInLock(new_term int64) error {
 		log.Fatalf("updateTermInLock with new:%d not greater than mine:%d", new_term, p.current_term)
 	}
 	p.current_term = new_term
-	termbytes := []byte(fmt.Sprintf("%d", p.current_term))
-	if err := p.store.SaveTerm(termbytes); err != nil {
+	if err := p.store.SaveTerm(p.current_term); err != nil {
 		return err
 	}
 	p.vote_for = ""
-	votebytes := []byte(fmt.Sprintf("%s", p.vote_for))
-	if err := p.store.SaveVoteFor(votebytes); err != nil {
+	if err := p.store.SaveVoteFor(p.vote_for); err != nil {
 		return err
 	}
 	return nil
@@ -254,8 +319,7 @@ func (p *PeerServer) voteInLock(id string) error {
 		log.Fatalf("vote_for should be empty")
 	}
 	p.vote_for = id
-	votebytes := []byte(fmt.Sprintf("%s", p.vote_for))
-	if err := p.store.SaveVoteFor(votebytes); err != nil {
+	if err := p.store.SaveVoteFor(p.vote_for); err != nil {
 		return err
 	}
 	return nil
@@ -271,24 +335,16 @@ func (p *PeerServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq
 	rsp.Header = new(pb.ResHeader)
 	if req.Term < now_term {
 		rsp.Term = now_term
-		rsp.Success = 0
+		rsp.Result = int32(AE_OK)
 		return rsp, nil
 	}
 	p.new_entry_pair.input <- req
 	pipe_output := <-p.new_entry_pair.output
-	if pipe_output.err == AE_RETRY {
+	if pipe_output.Result == int32(AE_RETRY) {
 		log.Infof("appendEntry with term:%d retries", req.Term)
 		return p.AppendEntries(ctx, req)
 	}
-	if pipe_output.err == AE_ERR {
-		log.Errorf("appendEntry term:%d failed with info:%s", req.Term, pipe_output.msg)
-		rsp.Term = pipe_output.term
-		rsp.Success = 0
-	} else {
-		rsp.Term = pipe_output.term
-		rsp.Success = 1
-	}
-	return rsp, nil
+	return pipe_output, nil
 }
 
 func (p *PeerServer) VoteForSelf(channel chan *pb.RequestVoteRes) int64 {
@@ -375,19 +431,21 @@ func (p *PeerServer) Elect() {
 		case tmp := <-p.new_entry_pair.input:
 			if new_term > tmp.Term {
 				log.Infof("elect term:%d got entry with smaller term:%d, keep wait", new_term, tmp.Term)
-				p.new_entry_pair.output <- &AppendEntryOutput{
-					err:  AE_ERR,
-					msg:  fmt.Sprintf("reqterm:%d smaller than candidate:%d", tmp.Term, new_term),
-					term: new_term,
+				p.new_entry_pair.output <- &pb.AppendEntriesRes{
+					Header: new(pb.ResHeader),
+					Result: int32(AE_SMALL_TERM),
+					Msg:    fmt.Sprintf("reqterm:%d smaller than candidate:%d", tmp.Term, new_term),
+					Term:   new_term,
 				}
 			} else {
 				log.Infof("elect term:%d got monotonic term:%d, turn to follower", new_term, tmp.Term)
 				p.UpdateTerm(tmp.Term)
 				p.ChangeState(pb.PeerState_Follower)
-				p.new_entry_pair.output <- &AppendEntryOutput{
-					err:  AE_RETRY,
-					msg:  "",
-					term: tmp.Term,
+				p.new_entry_pair.output <- &pb.AppendEntriesRes{
+					Header: new(pb.ResHeader),
+					Result: int32(AE_RETRY),
+					Msg:    "",
+					Term:   tmp.Term,
 				}
 				return
 			}
@@ -452,19 +510,21 @@ WAIT_ELECT_FOR_END:
 			case tmp := <-p.new_entry_pair.input:
 				if new_term > tmp.Term {
 					log.Infof("elect term:%d got entry with smaller term:%d, keep wait", new_term, tmp.Term)
-					p.new_entry_pair.output <- &AppendEntryOutput{
-						err:  AE_ERR,
-						msg:  fmt.Sprintf("reqterm:%d smaller than candidate:%d", tmp.Term, new_term),
-						term: new_term,
+					p.new_entry_pair.output <- &pb.AppendEntriesRes{
+						Header: new(pb.ResHeader),
+						Result: int32(AE_SMALL_TERM),
+						Msg:    fmt.Sprintf("reqterm:%d smaller than candidate:%d", tmp.Term, new_term),
+						Term:   new_term,
 					}
 				} else {
 					log.Infof("elect term:%d got entry with monotonic term:%d, turn follower", new_term, tmp.Term)
 					p.UpdateTerm(tmp.Term)
 					p.ChangeState(pb.PeerState_Follower)
-					p.new_entry_pair.output <- &AppendEntryOutput{
-						err:  AE_RETRY,
-						msg:  "",
-						term: tmp.Term,
+					p.new_entry_pair.output <- &pb.AppendEntriesRes{
+						Header: new(pb.ResHeader),
+						Result: int32(AE_RETRY),
+						Msg:    "",
+						Term:   tmp.Term,
 					}
 					return
 				}

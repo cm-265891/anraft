@@ -6,13 +6,17 @@ type Entry struct {
 }
 
 type Iterator interface {
-    Next() (*Entry, error)
+    Entry() (*Entry, error)
+    Next()
     Close() error
+    ValidForPrefix(prefix []byte) bool
+    Valid() bool
 }
 
 type Storage interface {
 	Set(key []byte, val []byte) error
 	Get(key []byte) ([]byte, error)
+    Del(key []byte) error
     Close() error
-    Seek(key []byte) Iterator
+    Seek(key []byte, forward bool) Iterator
 }

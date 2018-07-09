@@ -7,12 +7,14 @@ import (
 
 type BadgerIterator struct {
 	iter *badger.Iterator
+    txn *badger.Txn
 }
 
-func (i *BadgerIterator) Next() (*storage.Entry, error) {
-	if i.iter.Valid() {
-		return nil, nil
-	}
+func (i *BadgerIterator) Next() {
+    i.iter.Next()
+}
+
+func (i *BadgerIterator) Entry() (*storage.Entry, error) {
 	result := storage.Entry{}
 	item := i.iter.Item()
 	result.Key = item.Key()
@@ -26,7 +28,16 @@ func (i *BadgerIterator) Next() (*storage.Entry, error) {
 
 func (i *BadgerIterator) Close() error {
 	i.iter.Close()
+    i.txn.Discard()
 	return nil
+}
+
+func (i *BadgerIterator) ValidForPrefix(prefix []byte) bool {
+    return i.iter.ValidForPrefix(prefix)
+}
+
+func (i *BadgerIterator) Valid() bool {
+    return i.iter.Valid()
 }
 
 type BadgerEngine struct {
@@ -52,11 +63,16 @@ func (b *BadgerEngine) Close() error {
 
 func (b *BadgerEngine) Set(key []byte, val []byte) error {
 	txn := b.db.NewTransaction(true)
-	return txn.Set(key, val)
+    defer txn.Discard()
+    if err := txn.Set(key, val); err != nil {
+        return err
+    }
+    return txn.Commit()
 }
 
 func (b *BadgerEngine) Get(key []byte) ([]byte, error) {
 	txn := b.db.NewTransaction(false)
+    defer txn.Discard()
 	itm, err := txn.Get(key)
 	if err != nil {
 		return nil, err
@@ -64,11 +80,27 @@ func (b *BadgerEngine) Get(key []byte) ([]byte, error) {
 	return itm.Value()
 }
 
-func (b *BadgerEngine) Seek(key []byte) storage.Iterator {
+func (b *BadgerEngine) Del(key []byte) error {
+	txn := b.db.NewTransaction(true)
+    defer txn.Discard()
+    if err := txn.Del(key); err != nil {
+        return err
+    }
+    return txn.Commit()
+}
+
+func (b *BadgerEngine) Seek(key []byte, forward bool) storage.Iterator {
 	txn := b.db.NewTransaction(false)
-	tmp := txn.NewIterator(badger.DefaultIteratorOptions)
+    options := badger.IteratorOptions{
+        PrefetchValues: true,
+        PrefetchSize:   100,
+        Reverse:        !forward,
+        AllVersions:    false,
+    }
+	tmp := txn.NewIterator(options)
 	tmp.Seek(key)
 	return &BadgerIterator{
 		iter: tmp,
+        txn: txn,
 	}
 }
