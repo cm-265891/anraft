@@ -3,6 +3,7 @@ package peer
 import (
 	pb "anraft/proto/peer_proto"
 	"anraft/storage"
+	"anraft/utils"
 	"fmt"
 	"github.com/ngaut/log"
 	context "golang.org/x/net/context"
@@ -59,15 +60,14 @@ type PeerInfo struct {
 	client pb.PeerClient
 }
 
-type AppendEntryOutput struct {
-	err  AeResult
-	msg  string
-	term int64
-}
-
 type NewEntryPair struct {
 	input  chan *pb.AppendEntriesReq
 	output chan *pb.AppendEntriesRes
+}
+
+type VotePair struct {
+	input  chan *pb.RequestVoteReq
+	output chan *pb.RequestVoteRes
 }
 
 func (p *PeerInfo) Init(id string, host string) error {
@@ -96,28 +96,26 @@ type PeerServer struct {
 	// in-mem cache of the in-disk persistent term, protected by mutex
 	current_term int64
 	// in-mem cache of the in-disk persistent vote_for, protected by mutex
-	vote_for       string
+	vote_for string
+	// in-mem cache of the persist commit-index
+	commit_index   int64
 	state          pb.PeerState
 	store          *PeerStorage
 	new_entry_pair *NewEntryPair
-	new_entry_chan []chan int64
+	vote_pair      *VotePair
 	close_chan     chan int
 	/* the name of election_timeout is from 5.2 */
 	/* if a follower receives on communication over a period of time */
 	/* called the election timeout, then ...... */
-	election_timeout time.Duration
-	commit_idx       int64
-	last_applied     int64
+	election_timeout  time.Duration
+	election_interval time.Duration
 }
 
-// TODO(deyukong): we should make some guarentees about the modifications to state
-// who can change the state?
-
-func (p *PeerServer) Init(my_id, my_host string, hosts map[string]string) error {
+func (p *PeerServer) Init(my_id, my_host string, hosts map[string]string,
+	store_engine storage.Storage, etime time.Duration) error {
 	if _, ok := hosts[my_host]; !ok {
 		return fmt.Errorf("self should be in cluster")
 	}
-
 	p.host = my_host
 	p.id = my_id
 	p.cluster_info = []*PeerInfo{}
@@ -126,6 +124,8 @@ func (p *PeerServer) Init(my_id, my_host string, hosts map[string]string) error 
 		peerInfo.Init(id, host)
 		p.cluster_info = append(p.cluster_info, &peerInfo)
 	}
+	p.election_timeout = etime
+	p.election_interval = etime / 3
 	/* see 5.2 leader election */
 	/* when servers start up, they begin as followers */
 	p.state = pb.PeerState_Follower
@@ -133,7 +133,24 @@ func (p *PeerServer) Init(my_id, my_host string, hosts map[string]string) error 
 		input:  make(chan *pb.AppendEntriesReq),
 		output: make(chan *pb.AppendEntriesRes),
 	}
-	// TODO(deyukong): make full init
+	p.vote_pair = &VotePair{
+		input:  make(chan *pb.RequestVoteReq),
+		output: make(chan *pb.RequestVoteRes),
+	}
+	p.close_chan = make(chan int)
+	p.store = &PeerStorage{}
+	p.store.Init(store_engine)
+
+	var err error = nil
+	if p.current_term, err = p.store.GetTerm(); err != nil {
+		return err
+	}
+	if p.vote_for, err = p.store.GetVoteFor(); err != nil {
+		return err
+	}
+	if p.commit_index, err = p.store.GetCommitIndex(); err != nil {
+		return err
+	}
 	go p.RoleManageThd()
 	return nil
 }
@@ -155,6 +172,12 @@ func (p *PeerServer) RoleManageThd() {
 	for {
 		if p.state == pb.PeerState_Follower {
 			p.FollowerCron()
+		} else if p.state == pb.PeerState_Leader {
+			p.LeaderCron()
+		} else if p.state == pb.PeerState_Candidate {
+			log.Fatalf("candidate state, code should not reach here")
+		} else {
+			log.Fatalf("invalid state:%d", int(p.state))
 		}
 	}
 }
@@ -164,9 +187,16 @@ func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEn
 	if p.state != pb.PeerState_Follower {
 		log.Fatalf("append entry but role[%v] not follower", p.state)
 	}
-	if p.current_term != entries.Term {
-		log.Fatalf("append entry but term[%d:%d] not match", p.current_term, entries.Term)
+	if p.current_term > entries.Term {
+		log.Infof("append entry but smaller term[%d:%d]", p.current_term, entries.Term)
+		return &pb.AppendEntriesRes{
+			Header: new(pb.ResHeader),
+			Term:   p.current_term,
+			Result: int32(AE_SMALL_TERM),
+		}
 	}
+
+	p.UpdateTerm(entries.Term)
 
 	var iter storage.Iterator = nil
 	if entries.PrevLogIndex == -1 {
@@ -256,6 +286,13 @@ func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEn
 		}
 	}
 
+	// update my commit index
+	if p.commit_index > entries.LeaderCommit {
+		log.Fatalf("my commitidx:%d shouldnt be greater than master's:%d", p.commit_index, entries.LeaderCommit)
+	}
+
+	p.UpdateCommitIndex(utils.Int64Min(entries.LeaderCommit, entries.Entries[len(entries.Entries)-1].Index))
+
 	return &pb.AppendEntriesRes{
 		Header: new(pb.ResHeader),
 		Term:   entries.Term,
@@ -263,31 +300,107 @@ func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEn
 	}
 }
 
+func (p *PeerServer) LeaderCron() {
+	for {
+		select {
+		case <-p.close_chan:
+			log.Infof("leader cron stops...")
+			return
+		case tmp := <-p.new_entry_pair.input:
+			if p.current_term > tmp.Term {
+				log.Infof("leader term:%d got entry with smaller term:%d", p.current_term, tmp.Term)
+				p.new_entry_pair.output <- &pb.AppendEntriesRes{
+					Header: new(pb.ResHeader),
+					Result: int32(AE_SMALL_TERM),
+					Msg:    fmt.Sprintf("req term:%d smaller than candidate:%d", tmp.Term, p.current_term),
+					Term:   p.current_term,
+				}
+			} else if p.current_term == tmp.Term {
+				log.Fatalf("BUG:leader term:%d meet appendentry:%v same term", p.current_term, tmp)
+			} else {
+				log.Infof("leader term:%d got entry monotonic term:%d, turn follower", p.current_term, tmp.Term)
+				p.UpdateTerm(tmp.Term)
+				p.ChangeState(pb.PeerState_Follower)
+				p.new_entry_pair.output <- &pb.AppendEntriesRes{
+					Header: new(pb.ResHeader),
+					Result: int32(AE_RETRY),
+					Msg:    "",
+					Term:   p.current_term,
+				}
+				return
+			}
+		case tmp := <-p.vote_pair.input:
+			if ok, reason := p.GrantVote(tmp); !ok {
+				log.Infof("leader term:%d got vote, not grant:%s", p.current_term, reason)
+				p.vote_pair.output <- &pb.RequestVoteRes{
+					Header:      new(pb.ResHeader),
+					VoteGranted: p.vote_for,
+					// although vote not granted, it is still guaranteed that if other's term is greater,
+					// ours is also updated to other's
+					Term: p.current_term,
+				}
+			} else {
+				log.Infof("leader term:%d got vote and granted", p.current_term)
+				p.vote_pair.output <- &pb.RequestVoteRes{
+					Header:      new(pb.ResHeader),
+					VoteGranted: p.vote_for,
+					Term:        p.current_term,
+				}
+				return
+			}
+		}
+	}
+}
+
 func (p *PeerServer) FollowerCron() {
+	tchan := time.After(p.election_timeout)
 	for {
 		select {
 		case <-p.close_chan:
 			log.Infof("follower cron stops...")
 			return
-		case <-time.After(p.election_timeout):
+		case <-tchan:
 			p.ElecTimeout()
 			return
 		case tmp := <-p.new_entry_pair.input:
 			p.new_entry_pair.output <- p.appendNewEntries(tmp)
+			tchan = time.After(p.election_timeout)
+		case tmp := <-p.vote_pair.input:
+			if ok, reason := p.GrantVote(tmp); !ok {
+				log.Infof("follower got vote, now_term:%d not grant:%s", p.current_term, reason)
+				p.vote_pair.output <- &pb.RequestVoteRes{
+					Header:      new(pb.ResHeader),
+					VoteGranted: p.vote_for,
+					// although vote not granted, it is still guaranteed that if other's term is greater,
+					// ours is also updated to other's
+					Term: p.current_term,
+				}
+			} else {
+				log.Infof("follower got vote and granted, current_term:%d", p.current_term)
+				p.vote_pair.output <- &pb.RequestVoteRes{
+					Header:      new(pb.ResHeader),
+					VoteGranted: p.vote_for,
+					Term:        p.current_term,
+				}
+			}
 		}
 	}
 }
 
+// NOTE(deyukong): this is run in a temp thread, never touch shared states
 func request_vote(p *PeerInfo, term int64, timeout time.Duration,
-	channel chan *pb.RequestVoteRes, wg *sync.WaitGroup) {
+	last_entry *pb.LogEntry, channel chan *pb.RequestVoteRes, wg *sync.WaitGroup) {
 	defer wg.Done()
 	req := new(pb.RequestVoteReq)
 	req.Header = new(pb.ReqHeader)
 	req.Term = term
 	req.CandidateId = p.id
-	// TODO(deyukong): impl this below
-	req.LastLogIndex = 0
-	req.LastLogTerm = 0
+	req.LastLogIndex = -1
+	req.LastLogTerm = -1
+	if last_entry != nil {
+		req.LastLogIndex = last_entry.Index
+		req.LastLogTerm = last_entry.Term
+	}
 	ctx, _ := context.WithTimeout(context.Background(), timeout)
 	rsp, err := p.client.RequestVote(ctx, req)
 	if err != nil {
@@ -325,8 +438,35 @@ func (p *PeerServer) voteInLock(id string) error {
 	return nil
 }
 
-func (p *PeerServer) RequestVote(context.Context, *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
-	return nil, nil
+func (p *PeerServer) RequestVote(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
+	now_term, vote_for := p.GetTermAndVoteFor()
+	rsp := new(pb.RequestVoteRes)
+	rsp.Header = new(pb.ResHeader)
+	if req.Term < now_term {
+		rsp.Term = now_term
+		rsp.VoteGranted = vote_for
+		return rsp, nil
+	}
+	p.vote_pair.input <- req
+	return <-p.vote_pair.output, nil
+}
+
+// TODO(deyukong): unittests about term, logterm, it's quite complex
+func (p *PeerServer) IsLogUpToDate(req *pb.RequestVoteReq) bool {
+	last_entry, err := p.store.GetLastLogEntry()
+	if err != nil {
+		log.Fatalf("get last entry failed:%v", err)
+	}
+	// mine is nil, whatever is uptodate with me.
+	if last_entry == nil {
+		return true
+	}
+	// chapter5.4.2 defines strictly what is "up-to-date"
+	// if the logs have last entries with different terms, then the log with the later term is more up-to-date.
+	// if the logs end with the same term, then whichever log is longer(NOTE:deyukong, "longer" here I think
+	// is synonymous with "greater index') is more up-to-update
+	return req.LastLogTerm > last_entry.Term ||
+		(req.LastLogTerm == last_entry.Term && req.LastLogIndex >= last_entry.Index)
 }
 
 func (p *PeerServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq) (*pb.AppendEntriesRes, error) {
@@ -347,6 +487,24 @@ func (p *PeerServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq
 	return pipe_output, nil
 }
 
+func (p *PeerServer) UpdateCommitIndex(idx int64) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	// it's upper logic's duty to guarentee this
+	if p.commit_index > idx {
+		log.Fatalf("UpdateCommitIndex with smaller index:%d, mine:%d", idx, p.commit_index)
+	}
+	if p.commit_index == idx {
+		return
+	}
+
+	if err := p.store.SaveCommitIndex(idx); err != nil {
+		log.Fatalf("SaveCommitIndex:%d failed:%v", idx, err)
+	}
+	p.commit_index = idx
+}
+
 func (p *PeerServer) VoteForSelf(channel chan *pb.RequestVoteRes) int64 {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
@@ -364,10 +522,39 @@ func (p *PeerServer) VoteForSelf(channel chan *pb.RequestVoteRes) int64 {
 	return p.current_term
 }
 
+// NOTE(deyukong): can only be called from main thread
+func (p *PeerServer) GrantVote(req *pb.RequestVoteReq) (bool, string) {
+	if p.current_term > req.Term {
+		return false, fmt.Sprintf("smaller term, mine:%d, his:%d", p.current_term, req.Term)
+	}
+	if p.current_term == req.Term && p.vote_for != "" && p.vote_for != req.CandidateId {
+		return false, fmt.Sprintf("same term:%d voted for others:%s", p.current_term, p.vote_for)
+	}
+
+	// here, current_term <= req.Term, no matter vote granted or not, we must update our term
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	if p.current_term < req.Term {
+		if err := p.updateTermInLock(req.Term); err != nil {
+			log.Fatalf("updateTermInLock failed:%v", err)
+		}
+	}
+	if !p.IsLogUpToDate(req) {
+		return false, fmt.Sprintf("log not as uptodate")
+	}
+	if err := p.voteInLock(req.CandidateId); err != nil {
+		log.Fatalf("voteInLock failed:%v", err)
+	}
+	return true, ""
+}
+
 func (p *PeerServer) UpdateTerm(term int64) bool {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	if p.current_term >= term {
+	if p.current_term > term {
+		log.Fatalf("it's upper logic to guarentee current_term > term before update")
+	}
+	if p.current_term == term {
 		return false
 	}
 	if err := p.updateTermInLock(term); err != nil {
@@ -376,10 +563,17 @@ func (p *PeerServer) UpdateTerm(term int64) bool {
 	return true
 }
 
+// used for user-interactive thread, protected by mutex
 func (p *PeerServer) GetTerm() int64 {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 	return p.current_term
+}
+
+func (p *PeerServer) GetTermAndVoteFor() (int64, string) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	return p.current_term, p.vote_for
 }
 
 func (p *PeerServer) changeStateInLock(s pb.PeerState) {
@@ -411,16 +605,20 @@ func (p *PeerServer) Elect() {
 	log.Infof("begin a new election with new_term:%d", new_term)
 	var wg sync.WaitGroup
 	wchan := make(chan int)
+	last_entry, err := p.store.GetLastLogEntry()
+	if err != nil {
+		log.Fatalf("get last entry failed:%v", err)
+	}
 	for _, o := range p.cluster_info {
 		if o.host == p.host {
 			continue
 		}
 		wg.Add(1)
-		go request_vote(o, new_term, p.election_timeout, vote_chan, &wg)
+		go request_vote(o, new_term, p.election_timeout, last_entry, vote_chan, &wg)
 	}
 	go func() {
 		wg.Wait()
-		wchan <- 1
+		close(wchan)
 	}()
 
 	for {
@@ -438,14 +636,33 @@ func (p *PeerServer) Elect() {
 					Term:   new_term,
 				}
 			} else {
-				log.Infof("elect term:%d got monotonic term:%d, turn to follower", new_term, tmp.Term)
+				log.Infof("elect term:%d got entry monotonic term:%d, turn to follower", new_term, tmp.Term)
 				p.UpdateTerm(tmp.Term)
 				p.ChangeState(pb.PeerState_Follower)
 				p.new_entry_pair.output <- &pb.AppendEntriesRes{
 					Header: new(pb.ResHeader),
 					Result: int32(AE_RETRY),
 					Msg:    "",
-					Term:   tmp.Term,
+					Term:   p.current_term,
+				}
+				return
+			}
+		case tmp := <-p.vote_pair.input:
+			if ok, reason := p.GrantVote(tmp); !ok {
+				log.Infof("elect term:%d got vote, now_term:%d not grant:%s", new_term, p.current_term, reason)
+				p.vote_pair.output <- &pb.RequestVoteRes{
+					Header:      new(pb.ResHeader),
+					VoteGranted: p.vote_for,
+					// although vote not granted, it is still guaranteed that if other's term is greater,
+					// ours is also updated to other's
+					Term: p.current_term,
+				}
+			} else {
+				log.Infof("elect term:%d got vote and granted, current_term:%d", new_term, p.current_term)
+				p.vote_pair.output <- &pb.RequestVoteRes{
+					Header:      new(pb.ResHeader),
+					VoteGranted: p.vote_for,
+					Term:        p.current_term,
 				}
 				return
 			}
@@ -497,11 +714,7 @@ WAIT_ELECT_FOR_END:
 		nanocount := int64(p.election_timeout / time.Nanosecond)
 		sleep := time.Duration(int64(2*rand.Float64()*float64(nanocount))) * time.Nanosecond
 		log.Infof("elect draw, sleep for:%v and retry", sleep)
-		tchan := make(chan int)
-		go func() {
-			<-time.After(sleep)
-			tchan <- 1
-		}()
+		tchan := time.After(sleep)
 		for {
 			select {
 			case <-tchan:
@@ -524,7 +737,26 @@ WAIT_ELECT_FOR_END:
 						Header: new(pb.ResHeader),
 						Result: int32(AE_RETRY),
 						Msg:    "",
-						Term:   tmp.Term,
+						Term:   p.current_term,
+					}
+					return
+				}
+			case tmp := <-p.vote_pair.input:
+				if ok, reason := p.GrantVote(tmp); !ok {
+					log.Infof("elect term:%d got vote, now_term:%d not grant:%s", new_term, p.current_term, reason)
+					p.vote_pair.output <- &pb.RequestVoteRes{
+						Header:      new(pb.ResHeader),
+						VoteGranted: p.vote_for,
+						// although vote not granted, it is still guaranteed that if other's term is greater,
+						// ours is also updated to other's
+						Term: p.current_term,
+					}
+				} else {
+					log.Infof("elect term:%d got vote and granted, current_term:%d", new_term, p.current_term)
+					p.vote_pair.output <- &pb.RequestVoteRes{
+						Header:      new(pb.ResHeader),
+						VoteGranted: p.vote_for,
+						Term:        p.current_term,
 					}
 					return
 				}
