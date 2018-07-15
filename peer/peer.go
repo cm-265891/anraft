@@ -70,6 +70,11 @@ type VotePair struct {
 	output chan *pb.RequestVoteRes
 }
 
+type aeWithId struct {
+	id  string
+	res *pb.AppendEntriesRes
+}
+
 func (p *PeerInfo) Init(id string, host string) error {
 	// NOTE(deyukong): things may be difficult if servers cheat about their ids.
 	// but raft is non-byzantine, it's ops' duty to ensure this.
@@ -182,6 +187,7 @@ func (p *PeerServer) RoleManageThd() {
 	}
 }
 
+// TODO(deyukong): check about my commit-point and first-log
 func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEntriesRes {
 	// it's the upper logic's duty to guarantee the correct role at this point
 	if p.state != pb.PeerState_Follower {
@@ -197,6 +203,14 @@ func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEn
 	}
 
 	p.UpdateTerm(entries.Term)
+	if len(entries.Entries) == 0 {
+		// heartbeat
+		return &pb.AppendEntriesRes{
+			Header: new(pb.ResHeader),
+			Term:   p.current_term,
+			Result: int32(AE_OK),
+		}
+	}
 
 	var iter storage.Iterator = nil
 	if entries.PrevLogIndex == -1 {
@@ -241,6 +255,7 @@ func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEn
 
 	// set apply_from default to len(entries.Entries), if all matches, we have nothing to apply
 	apply_from := len(entries.Entries)
+	has_conflict := false
 	for idx, master_entry := range entries.Entries {
 		// seek to the end
 		if !iter.ValidForPrefix(LOG_PREFIX) {
@@ -259,6 +274,7 @@ func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEn
 		}
 		if entry.Term != master_entry.Term {
 			apply_from = idx
+			has_conflict = true
 			break
 		}
 		// entry.Term == master_entry.Term
@@ -266,7 +282,7 @@ func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEn
 	}
 
 	// at most times, code reaches here with iter invalid
-	for ; iter.ValidForPrefix(LOG_PREFIX); iter.Next() {
+	for ; has_conflict && iter.ValidForPrefix(LOG_PREFIX); iter.Next() {
 		entry, err := IterEntry2Log(iter)
 		if err != nil {
 			log.Fatalf("logentry parse failed:%v", err)
@@ -291,8 +307,18 @@ func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEn
 		log.Fatalf("my commitidx:%d shouldnt be greater than master's:%d", p.commit_index, entries.LeaderCommit)
 	}
 
-	p.UpdateCommitIndex(utils.Int64Min(entries.LeaderCommit, entries.Entries[len(entries.Entries)-1].Index))
-
+	new_commit := utils.Int64Min(entries.LeaderCommit, entries.Entries[len(entries.Entries)-1].Index)
+	// it may happens when master re-apply old logs which have already been applied.
+	if new_commit < p.commit_index {
+		last_entry, err := p.store.GetLastLogEntry()
+		if err != nil || last_entry == nil {
+			log.Fatalf("get last entry failed:%v", err)
+		}
+		log.Warnf("new_commit:%d less than mine:%d, last_idx:%d", new_commit, p.commit_index, last_entry.Index)
+	} else {
+		// commit_idx should be monotonic
+		p.UpdateCommitIndex(new_commit)
+	}
 	return &pb.AppendEntriesRes{
 		Header: new(pb.ResHeader),
 		Term:   entries.Term,
@@ -300,12 +326,127 @@ func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEn
 	}
 }
 
+func heartBeat(p *PeerInfo, term int64, id string, commit_idx int64, timeout time.Duration,
+	hb_chan chan *aeWithId, wg *sync.WaitGroup) {
+	defer wg.Done()
+	req := new(pb.AppendEntriesReq)
+	req.Header = new(pb.ReqHeader)
+	req.Term = term
+	req.LeaderId = id
+	req.LeaderCommit = commit_idx
+	req.PrevLogIndex = -1
+	req.PrevLogTerm = -1
+	ctx, _ := context.WithTimeout(context.Background(), timeout)
+	rsp, err := p.client.AppendEntries(ctx, req)
+	if err != nil {
+		log.Errorf("heartbeat:%v failed:%v", req, err)
+		return
+	}
+	hb_chan <- &aeWithId{
+		id:  id,
+		res: rsp,
+	}
+}
+
+// term is raft's term, not terminate
+func (p *PeerServer) LeaderHeartBeatCron(term_chan chan int64, stop_chan chan int, exit_wg *sync.WaitGroup) {
+	defer exit_wg.Done()
+	for {
+		select {
+		case <-stop_chan:
+			log.Infof("leader hb stops...")
+			return
+		case <-time.After(p.election_interval):
+			current_term := p.GetTerm()
+			hb_chan := make(chan *aeWithId, len(p.cluster_info)-1)
+			var wg sync.WaitGroup
+			for _, o := range p.cluster_info {
+				if o.host == p.host {
+					continue
+				}
+				wg.Add(1)
+				go heartBeat(o, current_term, p.id, p.commit_index, p.election_interval, hb_chan, &wg)
+			}
+			wg.Wait()
+			max_term := current_term
+			// NOTE(deyukong): from the aspect of symmetry, master should stepdown if it does not receive
+			// hb from the majority. but the paper didnt mention it
+			for o := range hb_chan {
+				if o.res.Result != int32(AE_OK) {
+					log.Infof("get hb from:%s not ok[%d:%s]", o.id, o.res.Result, o.res.Msg)
+				}
+				if o.res.Term > max_term {
+					max_term = o.res.Term
+				}
+			}
+			if max_term > current_term {
+				term_chan <- max_term
+			}
+		}
+	}
+}
+
+func (p *PeerServer) TransLog(target *PeerInfo, translog_chan chan *pb.AppendEntriesRes, stop_chan chan int, exit_wg *sync.WaitGroup) {
+}
+
 func (p *PeerServer) LeaderCron() {
+	//next_idx := []int64{}
+	//match_idx := []int64{}
+	hb_term_chan := make(chan int64)
+	hb_stop_chan := make(chan int)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go p.LeaderHeartBeatCron(hb_term_chan, hb_stop_chan, &wg)
+
+	translog_chans := [](chan *pb.AppendEntriesRes){}
+	translog_stop_chans := [](chan int){}
+	for _, o := range p.cluster_info {
+		translog_chan := make(chan *pb.AppendEntriesRes)
+		translog_chans = append(translog_chans, translog_chan)
+		translog_stop_chan := make(chan int)
+		translog_stop_chans = append(translog_stop_chans, translog_stop_chan)
+		wg.Add(1)
+		go p.TransLog(o, translog_chan, translog_stop_chan, &wg)
+	}
+
+	// cleanup goroutines, be very careful about channel cyclic-dependency, alive-locks
+	defer func() {
+		hb_stop_chan <- 1
+		// TODO(deyukong): stop translog channels
+		wg_chan := make(chan int)
+		go func() {
+			wg.Wait()
+			close(wg_chan)
+		}()
+		for {
+			// no need to handle new_entry_pair and vote_pair, they are global and
+			// every loop will handle thees two pairs, but hb_term_chan and {???} are
+			// local channels, we must strictly control their scopes, limit them in
+			// leader-loop
+			select {
+			case tmp := <-hb_term_chan:
+				log.Infof("ignore msg:%d from hb_term_chan since master stepping down", tmp)
+			case <-wg_chan:
+				log.Infof("hb channel and translog channels are all closed, leader stepdown finish")
+				return
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-p.close_chan:
 			log.Infof("leader cron stops...")
 			return
+		case tmp := <-hb_term_chan:
+			if tmp > p.current_term {
+				log.Infof("leader term:%d got hb monotonic term:%d, turn follower", p.current_term, tmp)
+				p.UpdateTerm(tmp)
+				p.ChangeState(pb.PeerState_Follower)
+				return
+			} else {
+				log.Infof("leader term:%d got hb:%d smaller", p.current_term, tmp)
+			}
 		case tmp := <-p.new_entry_pair.input:
 			if p.current_term > tmp.Term {
 				log.Infof("leader term:%d got entry with smaller term:%d", p.current_term, tmp.Term)
@@ -330,14 +471,26 @@ func (p *PeerServer) LeaderCron() {
 				return
 			}
 		case tmp := <-p.vote_pair.input:
+			old_term := p.current_term
 			if ok, reason := p.GrantVote(tmp); !ok {
-				log.Infof("leader term:%d got vote, not grant:%s", p.current_term, reason)
+				log.Infof("leader term:%d got vote, not grant:%s", old_term, reason)
 				p.vote_pair.output <- &pb.RequestVoteRes{
 					Header:      new(pb.ResHeader),
 					VoteGranted: p.vote_for,
 					// although vote not granted, it is still guaranteed that if other's term is greater,
 					// ours is also updated to other's
 					Term: p.current_term,
+				}
+				if old_term > p.current_term {
+					log.Fatalf("BUG:vote term smaller[%d:%d]", old_term, p.current_term)
+				}
+				if old_term < p.current_term {
+					// although vote not granted, term is updated, it happens when requester has
+					// greater term but not up=to-date log-entries, in this situation, we
+					// still have to stopdown to follwer
+					log.Infof("leader term:%d got vote not granted but term updated:%d, turn follower", old_term, p.current_term)
+					p.ChangeState(pb.PeerState_Follower)
+					return
 				}
 			} else {
 				log.Infof("leader term:%d got vote and granted", p.current_term)
@@ -346,6 +499,7 @@ func (p *PeerServer) LeaderCron() {
 					VoteGranted: p.vote_for,
 					Term:        p.current_term,
 				}
+				p.ChangeState(pb.PeerState_Follower)
 				return
 			}
 		}
@@ -388,7 +542,7 @@ func (p *PeerServer) FollowerCron() {
 }
 
 // NOTE(deyukong): this is run in a temp thread, never touch shared states
-func request_vote(p *PeerInfo, term int64, timeout time.Duration,
+func requestVote(p *PeerInfo, term int64, timeout time.Duration,
 	last_entry *pb.LogEntry, channel chan *pb.RequestVoteRes, wg *sync.WaitGroup) {
 	defer wg.Done()
 	req := new(pb.RequestVoteReq)
@@ -614,7 +768,7 @@ func (p *PeerServer) Elect() {
 			continue
 		}
 		wg.Add(1)
-		go request_vote(o, new_term, p.election_timeout, last_entry, vote_chan, &wg)
+		go requestVote(o, new_term, p.election_timeout, last_entry, vote_chan, &wg)
 	}
 	go func() {
 		wg.Wait()
