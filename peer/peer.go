@@ -70,9 +70,10 @@ type VotePair struct {
 	output chan *pb.RequestVoteRes
 }
 
-type aeWithId struct {
-	id  string
-	res *pb.AppendEntriesRes
+type AeWrapper struct {
+	id        string
+	res       *pb.AppendEntriesRes
+	match_idx int64
 }
 
 func (p *PeerInfo) Init(id string, host string) error {
@@ -327,7 +328,7 @@ func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEn
 }
 
 func heartBeat(p *PeerInfo, term int64, id string, commit_idx int64, timeout time.Duration,
-	hb_chan chan *aeWithId, wg *sync.WaitGroup) {
+	hb_chan chan *AeWrapper, wg *sync.WaitGroup) {
 	defer wg.Done()
 	req := new(pb.AppendEntriesReq)
 	req.Header = new(pb.ReqHeader)
@@ -342,9 +343,10 @@ func heartBeat(p *PeerInfo, term int64, id string, commit_idx int64, timeout tim
 		log.Errorf("heartbeat:%v failed:%v", req, err)
 		return
 	}
-	hb_chan <- &aeWithId{
-		id:  id,
-		res: rsp,
+	hb_chan <- &AeWrapper{
+		id:        id,
+		res:       rsp,
+		match_idx: -1, // match_idx not used for heartbeat
 	}
 }
 
@@ -358,7 +360,7 @@ func (p *PeerServer) LeaderHeartBeatCron(term_chan chan int64, stop_chan chan in
 			return
 		case <-time.After(p.election_interval):
 			current_term := p.GetTerm()
-			hb_chan := make(chan *aeWithId, len(p.cluster_info)-1)
+			hb_chan := make(chan *AeWrapper, len(p.cluster_info)-1)
 			var wg sync.WaitGroup
 			for _, o := range p.cluster_info {
 				if o.host == p.host {
@@ -386,32 +388,153 @@ func (p *PeerServer) LeaderHeartBeatCron(term_chan chan int64, stop_chan chan in
 	}
 }
 
-func (p *PeerServer) TransLog(target *PeerInfo, translog_chan chan *pb.AppendEntriesRes, stop_chan chan int, exit_wg *sync.WaitGroup) {
+// TODO(deyukong): currently, we use a sleep(100ms default) to poll master's new entries
+// however, it may not provide the minimum latency between leader and follower. Here the
+// better choice is to use something like condvars, if client applies new entries, we can
+// get immediate signal.
+// TODO(deyukong): configure follower apply entry timeout/batchsize
+func (p *PeerServer) TransLog(target *PeerInfo, translog_chan chan *AeWrapper, stop_chan chan int, exit_wg *sync.WaitGroup) {
+	defer exit_wg.Done()
+
+	next_idx, match_idx := func() (int64, int64) {
+		last_entry, err := p.store.GetLastLogEntry()
+		if err != nil {
+			log.Fatalf("GetLastLogEntry failed:%v", err)
+		}
+		tmp_n := int64(-1)
+		tmp_m := int64(-1)
+		if last_entry == nil {
+			tmp_n = 0
+		} else {
+			tmp_n = last_entry.Index + 1
+		}
+		return tmp_n, tmp_m
+	}()
+
+	// duration default to 100 ms
+	duration := time.Duration(100) * time.Millisecond
+	batchsize := 100
+	// It is guarenteed that master's state and term never changes if this loop is running
+	term_snapshot := p.GetTerm()
+
+	for {
+		select {
+		case <-stop_chan:
+			log.Infof("leader to peer:%s translog stops...", target.host)
+			return
+		case <-time.After(duration):
+			last_entry, err := p.store.GetLastLogEntry()
+			if err != nil {
+				log.Fatalf("GetLastLogEntry failed:%v", err)
+			}
+			if last_entry == nil || last_entry.Index < next_idx {
+				// no new entries, we keep waiting, donot reduce wait-duration
+				break
+			}
+			entries := func() []*pb.LogEntry {
+				iter := p.store.SeekLogAt(next_idx)
+				defer iter.Close()
+				entries := []*pb.LogEntry{}
+				for ; iter.ValidForPrefix(LOG_PREFIX) && len(entries) < batchsize; iter.Next() {
+					entry, err := IterEntry2Log(iter)
+					if err != nil {
+						log.Fatalf("IterEntry2Log failed:%v", err)
+					}
+					entries = append(entries, entry)
+				}
+				return entries
+			}()
+			if len(entries) == 0 {
+				log.Fatalf("BUG:entries to send shouldnt be empty")
+			}
+			prev_idx, prev_term := func() (int64, int64) {
+				if next_idx == 0 {
+					return -1, -1
+				}
+				entry, err := p.store.GetLogEntry(next_idx - 1)
+				if err != nil {
+					log.Fatalf("get entry idx:%d failed:%v", next_idx-1, err)
+				}
+				return entry.Index, entry.Term
+			}()
+
+			req := new(pb.AppendEntriesReq)
+			req.Header = new(pb.ReqHeader)
+			req.Term = term_snapshot
+			req.LeaderId = p.id
+			if tmp, err := p.store.GetCommitIndex(); err != nil {
+				log.Fatalf("GetCommitIndex failed:%v", err)
+			} else {
+				req.LeaderCommit = tmp
+			}
+			req.PrevLogIndex = prev_idx
+			req.PrevLogTerm = prev_term
+			ctx, _ := context.WithTimeout(context.Background(), time.Duration(100)*time.Millisecond)
+			rsp, err := target.client.AppendEntries(ctx, req)
+			if err != nil {
+				log.Warnf("apply entries:%d to %s failed:%v", len(entries), p.host, err)
+				break
+			}
+			if rsp.Result == int32(AE_OK) {
+				batch_end_idx := entries[len(entries)-1].Index
+				if batch_end_idx < match_idx {
+					log.Fatalf("peer:%s batch:%d smaller than match_idx:%d", p.host, batch_end_idx, match_idx)
+				}
+				match_idx = batch_end_idx
+				next_idx = match_idx + 1
+				if len(entries) == batchsize {
+					duration = time.Duration(0) * time.Millisecond
+				} else {
+					duration = time.Duration(100) * time.Millisecond
+				}
+			} else if rsp.Result == int32(AE_TERM_UNMATCH) {
+				if next_idx == 0 {
+					log.Fatalf("peer:%s unmatch but we have reached the beginning", p.host)
+				} else {
+					// TODO(deyukong): too slow to find the common point, optimize
+					next_idx -= 1
+					if next_idx <= match_idx {
+						log.Fatalf("peer:%s unmatch before match_idx:%d", p.host, match_idx)
+					} else {
+						log.Warnf("peer:%s nextidx:%d backoff by one", p.host, next_idx)
+					}
+				}
+			} else if rsp.Result == int32(AE_RETRY) {
+				log.Fatalf("peer:%s reply AE_RETRY", p.host)
+			} else if rsp.Result == int32(AE_SMALL_TERM) {
+				// nothing
+			}
+			translog_chan <- &AeWrapper{
+				id:        p.host,
+				res:       rsp,
+				match_idx: match_idx,
+			}
+		}
+	}
 }
 
 func (p *PeerServer) LeaderCron() {
-	//next_idx := []int64{}
-	//match_idx := []int64{}
 	hb_term_chan := make(chan int64)
-	hb_stop_chan := make(chan int)
+	tmp_stop_chan := make(chan int)
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go p.LeaderHeartBeatCron(hb_term_chan, hb_stop_chan, &wg)
+	go p.LeaderHeartBeatCron(hb_term_chan, tmp_stop_chan, &wg)
 
-	translog_chans := [](chan *pb.AppendEntriesRes){}
-	translog_stop_chans := [](chan int){}
+	translog_chan := make(chan *AeWrapper)
 	for _, o := range p.cluster_info {
-		translog_chan := make(chan *pb.AppendEntriesRes)
-		translog_chans = append(translog_chans, translog_chan)
-		translog_stop_chan := make(chan int)
-		translog_stop_chans = append(translog_stop_chans, translog_stop_chan)
 		wg.Add(1)
-		go p.TransLog(o, translog_chan, translog_stop_chan, &wg)
+		go p.TransLog(o, translog_chan, tmp_stop_chan, &wg)
 	}
+
+	// TODO(deyukong): we must guarentee that master's term is invariant before the local channels terminates.
+	// otherwise, the two goroutines will use the true-leader's(other than me) term to send hb or logentries
+	// to followers. which in fact is a byzantine-situation.
+	new_term := p.current_term
+	var delayed_grantvote func() = nil
 
 	// cleanup goroutines, be very careful about channel cyclic-dependency, alive-locks
 	defer func() {
-		hb_stop_chan <- 1
+		close(tmp_stop_chan)
 		// TODO(deyukong): stop translog channels
 		wg_chan := make(chan int)
 		go func() {
@@ -420,7 +543,7 @@ func (p *PeerServer) LeaderCron() {
 		}()
 		for {
 			// no need to handle new_entry_pair and vote_pair, they are global and
-			// every loop will handle thees two pairs, but hb_term_chan and {???} are
+			// every loop will handle these two pairs, but hb_term_chan and {???} are
 			// local channels, we must strictly control their scopes, limit them in
 			// leader-loop
 			select {
@@ -428,6 +551,13 @@ func (p *PeerServer) LeaderCron() {
 				log.Infof("ignore msg:%d from hb_term_chan since master stepping down", tmp)
 			case <-wg_chan:
 				log.Infof("hb channel and translog channels are all closed, leader stepdown finish")
+				if new_term > p.current_term {
+					p.ChangeState(pb.PeerState_Follower)
+					p.UpdateTerm(new_term)
+				}
+				if delayed_grantvote != nil {
+					delayed_grantvote()
+				}
 				return
 			}
 		}
@@ -441,8 +571,7 @@ func (p *PeerServer) LeaderCron() {
 		case tmp := <-hb_term_chan:
 			if tmp > p.current_term {
 				log.Infof("leader term:%d got hb monotonic term:%d, turn follower", p.current_term, tmp)
-				p.UpdateTerm(tmp)
-				p.ChangeState(pb.PeerState_Follower)
+				new_term = tmp
 				return
 			} else {
 				log.Infof("leader term:%d got hb:%d smaller", p.current_term, tmp)
@@ -460,47 +589,44 @@ func (p *PeerServer) LeaderCron() {
 				log.Fatalf("BUG:leader term:%d meet appendentry:%v same term", p.current_term, tmp)
 			} else {
 				log.Infof("leader term:%d got entry monotonic term:%d, turn follower", p.current_term, tmp.Term)
-				p.UpdateTerm(tmp.Term)
-				p.ChangeState(pb.PeerState_Follower)
+				new_term = tmp.Term
 				p.new_entry_pair.output <- &pb.AppendEntriesRes{
 					Header: new(pb.ResHeader),
 					Result: int32(AE_RETRY),
 					Msg:    "",
-					Term:   p.current_term,
+					Term:   new_term,
 				}
 				return
 			}
 		case tmp := <-p.vote_pair.input:
-			old_term := p.current_term
-			if ok, reason := p.GrantVote(tmp); !ok {
-				log.Infof("leader term:%d got vote, not grant:%s", old_term, reason)
-				p.vote_pair.output <- &pb.RequestVoteRes{
-					Header:      new(pb.ResHeader),
-					VoteGranted: p.vote_for,
-					// although vote not granted, it is still guaranteed that if other's term is greater,
-					// ours is also updated to other's
-					Term: p.current_term,
+			if tmp.Term > new_term {
+				new_term = tmp.Term
+				// The grantVote process must be deferred to when local goroutines are all finished.
+				delayed_grantvote = func() {
+					ok, reason := p.GrantVote(tmp)
+					result := &pb.RequestVoteRes{
+						Header:      new(pb.ResHeader),
+						VoteGranted: p.vote_for,
+						Term:        p.current_term,
+					}
+					if !ok {
+						log.Infof("leader term:%d got vote[%s:%d], not grant:%s",
+							p.current_term, tmp.CandidateId, tmp.Term, reason)
+					} else {
+						log.Infof("leader term:%d got vote[%s:%d] and granted",
+							p.current_term, tmp.CandidateId, tmp.Term)
+					}
+					p.vote_pair.output <- result
 				}
-				if old_term > p.current_term {
-					log.Fatalf("BUG:vote term smaller[%d:%d]", old_term, p.current_term)
-				}
-				if old_term < p.current_term {
-					// although vote not granted, term is updated, it happens when requester has
-					// greater term but not up=to-date log-entries, in this situation, we
-					// still have to stopdown to follwer
-					log.Infof("leader term:%d got vote not granted but term updated:%d, turn follower", old_term, p.current_term)
-					p.ChangeState(pb.PeerState_Follower)
-					return
-				}
+				return
 			} else {
-				log.Infof("leader term:%d got vote and granted", p.current_term)
+				log.Infof("leader term:%d got smaller vote:%d from:%d, ignore",
+					p.current_term, tmp.Term, tmp.CandidateId)
 				p.vote_pair.output <- &pb.RequestVoteRes{
 					Header:      new(pb.ResHeader),
 					VoteGranted: p.vote_for,
 					Term:        p.current_term,
 				}
-				p.ChangeState(pb.PeerState_Follower)
-				return
 			}
 		}
 	}

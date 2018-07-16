@@ -108,6 +108,19 @@ func (p *PeerStorage) GetCommitIndex() (int64, error) {
 	}
 }
 
+func (p *PeerStorage) GetLogEntry(index int64) (*pb.LogEntry, error) {
+	key := fmt.Sprintf("%03d|%021d", LOG, index)
+	if bytes, err := p.engine.Get([]byte(key)); err != nil {
+		return nil, err
+	} else {
+		result := &pb.LogEntry{}
+		if err := proto.Unmarshal(bytes, result); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}
+}
+
 func (p *PeerStorage) SeekLogAt(index int64) storage.Iterator {
 	key := fmt.Sprintf("%03d|%021d", LOG, index)
 	return p.engine.Seek([]byte(key), true)
