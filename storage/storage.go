@@ -1,5 +1,13 @@
 package storage
 
+import (
+    "errors"
+)
+
+var (
+    ErrKeyNotFound = errors.New("Key not found")
+)
+
 type Entry struct {
     Key []byte
     Val []byte

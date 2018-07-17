@@ -2,6 +2,7 @@ package utils
 
 import (
 	"github.com/tsuru/config"
+    "os"
 )
 
 func GetConfigIntOrDefault(key string, d int) int {
@@ -29,4 +30,11 @@ func FileExist(path string) (bool, error) {
         return false, nil
     }
     return true, err
+}
+
+func Int64Min(a int64, b int64) int64 {
+    if a < b {
+        return a
+    }
+    return b
 }

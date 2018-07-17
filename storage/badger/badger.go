@@ -67,7 +67,7 @@ func (b *BadgerEngine) Set(key []byte, val []byte) error {
     if err := txn.Set(key, val); err != nil {
         return err
     }
-    return txn.Commit()
+    return txn.Commit(nil)
 }
 
 func (b *BadgerEngine) Get(key []byte) ([]byte, error) {
@@ -75,6 +75,9 @@ func (b *BadgerEngine) Get(key []byte) ([]byte, error) {
     defer txn.Discard()
 	itm, err := txn.Get(key)
 	if err != nil {
+        if err == badger.ErrKeyNotFound {
+            return nil, storage.ErrKeyNotFound
+        }
 		return nil, err
 	}
 	return itm.Value()
@@ -83,10 +86,10 @@ func (b *BadgerEngine) Get(key []byte) ([]byte, error) {
 func (b *BadgerEngine) Del(key []byte) error {
 	txn := b.db.NewTransaction(true)
     defer txn.Discard()
-    if err := txn.Del(key); err != nil {
+    if err := txn.Delete(key); err != nil {
         return err
     }
-    return txn.Commit()
+    return txn.Commit(nil)
 }
 
 func (b *BadgerEngine) Seek(key []byte, forward bool) storage.Iterator {
