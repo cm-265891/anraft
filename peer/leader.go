@@ -2,9 +2,11 @@ package peer
 
 import (
 	pb "anraft/proto/peer_proto"
+	"anraft/utils"
 	"fmt"
 	"github.com/ngaut/log"
 	context "golang.org/x/net/context"
+	"sort"
 	"sync"
 	"time"
 )
@@ -26,19 +28,18 @@ func heartBeat(p *PeerInfo, term int64, id string, commit_idx int64, timeout tim
 		return
 	}
 	hb_chan <- &AeWrapper{
-		id:        id,
-		res:       rsp,
-		idx: -1, // idx not used for heartbeat
-        term: -1, // term not used for heartbeat
+		id:  id,
+		res: rsp,
+		it:  nil, // idx and term not used for heartbeat
 	}
 }
 
 // term is raft's term, not terminate
-func (p *PeerServer) LeaderHeartBeatCron(term_chan chan int64, stop_chan chan int, exit_wg *sync.WaitGroup) {
-	defer exit_wg.Done()
+func (p *PeerServer) LeaderHeartBeatCron(term_chan chan int64, closer *utils.Closer) {
+	defer closer.Done()
 	for {
 		select {
-		case <-stop_chan:
+		case <-closer.HasBeenClosed():
 			log.Infof("leader hb stops...")
 			return
 		case <-time.After(p.election_interval):
@@ -72,18 +73,43 @@ func (p *PeerServer) LeaderHeartBeatCron(term_chan chan int64, stop_chan chan in
 }
 
 func (p *PeerServer) initLeaderIndexes() (int64, int64) {
-    last_entry, err := p.store.GetLastLogEntry()
-    if err != nil {
-        log.Fatalf("GetLastLogEntry failed:%v", err)
-    }
-    tmp_n := int64(-1)
-    tmp_m := int64(-1)
-    if last_entry == nil {
-        tmp_n = 0
-    } else {
-        tmp_n = last_entry.Index + 1
-    }
-    return tmp_n, tmp_m
+	last_entry, err := p.store.GetLastLogEntry()
+	if err != nil {
+		log.Fatalf("GetLastLogEntry failed:%v", err)
+	}
+	tmp_n := int64(-1)
+	tmp_m := int64(-1)
+	if last_entry == nil {
+		tmp_n = 0
+	} else {
+		tmp_n = last_entry.Index + 1
+	}
+	return tmp_n, tmp_m
+}
+
+func (p *PeerServer) getLogBatch(next_idx int64, batchsize int) []*pb.LogEntry {
+	iter := p.store.SeekLogAt(next_idx)
+	defer iter.Close()
+	entries := []*pb.LogEntry{}
+	for ; iter.ValidForPrefix(LOG_PREFIX) && len(entries) < batchsize; iter.Next() {
+		entry, err := IterEntry2Log(iter)
+		if err != nil {
+			log.Fatalf("IterEntry2Log failed:%v", err)
+		}
+		entries = append(entries, entry)
+	}
+	return entries
+}
+
+func (p *PeerServer) getPrevLogIdxAndTerm(next_idx int64) (int64, int64) {
+	if next_idx == 0 {
+		return -1, -1
+	}
+	entry, err := p.store.GetLogEntry(next_idx - 1)
+	if err != nil {
+		log.Fatalf("get entry idx:%d failed:%v", next_idx-1, err)
+	}
+	return entry.Index, entry.Term
 }
 
 // TODO(deyukong): currently, we use a sleep(100ms default) to poll master's new entries
@@ -91,9 +117,8 @@ func (p *PeerServer) initLeaderIndexes() (int64, int64) {
 // better choice is to use something like condvars, if client applies new entries, we can
 // get immediate signal.
 // TODO(deyukong): configure follower apply entry timeout/batchsize
-func (p *PeerServer) TransLog(target *PeerInfo, translog_chan chan *AeWrapper, stop_chan chan int, exit_wg *sync.WaitGroup) {
-	defer exit_wg.Done()
-
+func (p *PeerServer) TransLog(target *PeerInfo, translog_chan chan *AeWrapper, closer *utils.Closer) {
+	defer closer.Done()
 	next_idx, match_idx := p.initLeaderIndexes()
 	// duration default to 100 ms
 	duration := time.Duration(100) * time.Millisecond
@@ -103,7 +128,7 @@ func (p *PeerServer) TransLog(target *PeerInfo, translog_chan chan *AeWrapper, s
 
 	for {
 		select {
-		case <-stop_chan:
+		case <-closer.HasBeenClosed():
 			log.Infof("leader to peer:%s translog stops...", target.host)
 			return
 		case <-time.After(duration):
@@ -115,32 +140,11 @@ func (p *PeerServer) TransLog(target *PeerInfo, translog_chan chan *AeWrapper, s
 				// no new entries, we keep waiting, donot reduce wait-duration
 				break
 			}
-			entries := func() []*pb.LogEntry {
-				iter := p.store.SeekLogAt(next_idx)
-				defer iter.Close()
-				entries := []*pb.LogEntry{}
-				for ; iter.ValidForPrefix(LOG_PREFIX) && len(entries) < batchsize; iter.Next() {
-					entry, err := IterEntry2Log(iter)
-					if err != nil {
-						log.Fatalf("IterEntry2Log failed:%v", err)
-					}
-					entries = append(entries, entry)
-				}
-				return entries
-			}()
+			entries := p.getLogBatch(next_idx, batchsize)
 			if len(entries) == 0 {
 				log.Fatalf("BUG:entries to send shouldnt be empty")
 			}
-			prev_idx, prev_term := func() (int64, int64) {
-				if next_idx == 0 {
-					return -1, -1
-				}
-				entry, err := p.store.GetLogEntry(next_idx - 1)
-				if err != nil {
-					log.Fatalf("get entry idx:%d failed:%v", next_idx-1, err)
-				}
-				return entry.Index, entry.Term
-			}()
+			prev_idx, prev_term := p.getPrevLogIdxAndTerm(next_idx)
 
 			req := new(pb.AppendEntriesReq)
 			req.Header = new(pb.ReqHeader)
@@ -188,44 +192,101 @@ func (p *PeerServer) TransLog(target *PeerInfo, translog_chan chan *AeWrapper, s
 			} else if rsp.Result == int32(AE_SMALL_TERM) {
 				// nothing
 			}
-			translog_chan <- &AeWrapper{
-				id:        p.host,
-				res:       rsp,
-				idx: match_idx,
-                term: entries[len(entries)-1].Term,
+			tmp := &AeWrapper{
+				id:  p.host,
+				res: rsp,
+				it: &IndexAndTerm{
+					idx:  -1,
+					term: -1,
+				},
 			}
+			if rsp.Result == int32(AE_OK) {
+				tmp.it.idx = entries[len(entries)-1].Index
+				tmp.it.term = entries[len(entries)-1].Term
+			}
+			translog_chan <- tmp
 		}
 	}
 }
 
-func (p *PeerServer) LeaderCron() {
-	hb_term_chan := make(chan int64)
-	tmp_stop_chan := make(chan int)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go p.LeaderHeartBeatCron(hb_term_chan, tmp_stop_chan, &wg)
+type CommitForwarder struct {
+	followers map[string]*IndexAndTerm
+}
 
+func (c *CommitForwarder) Init(plist []*PeerInfo) {
+	c.followers = make(map[string]*IndexAndTerm)
+	for _, p := range plist {
+		c.followers[p.id] = &IndexAndTerm{
+			idx:  -1,
+			term: -1,
+		}
+	}
+}
+
+func (p *PeerServer) ForwardCommitIndex(fwder *CommitForwarder, ae *AeWrapper) {
+	last_entry, err := p.store.GetLastLogEntry()
+	if err != nil {
+		log.Fatalf("GetLastLogEntry failed:%v", err)
+	}
+	if last_entry == nil {
+		log.Fatalf("leader has no entry, receive peer:%s result:%v", ae.id, ae.res)
+	}
+	it := fwder.followers[ae.id]
+	if it.idx > ae.it.idx {
+		log.Fatalf("BUG peer:%s log backtraces!", ae.id)
+	}
+	it.idx = ae.it.idx
+	it.term = ae.it.term
+
+	its := IndexAndTerms{}
+	term_snapshot := p.GetTerm()
+	for _, it := range fwder.followers {
+		if it.term == term_snapshot {
+			its = append(its, it)
+		}
+	}
+	// add leader itself's IndexAndTerm to make the logic clear
+	its = append(its, &IndexAndTerm{
+		idx:  last_entry.Index,
+		term: last_entry.Term,
+	})
+	sort.Sort(its)
+	majority_pos := len(p.cluster_info) / 2
+	if majority_pos >= len(its) {
+		return
+	}
+	commit_idx := p.GetCommitIndex()
+	if its[majority_pos].idx < commit_idx {
+		log.Fatalf("majority idx:%d commit_idx:%d backtrace", its[majority_pos].idx, commit_idx)
+	}
+	p.UpdateCommitIndex(its[majority_pos].idx)
+}
+
+func (p *PeerServer) LeaderCron() {
+	// init local variables
+	hb_term_chan := make(chan int64)
+	closer := utils.NewCloser()
 	translog_chan := make(chan *AeWrapper)
+	new_term := p.current_term
+	var delayed_grantvote func() = nil
+	commit_fwder := &CommitForwarder{}
+	commit_fwder.Init(p.cluster_info)
+
+	closer.AddOne()
+	go p.LeaderHeartBeatCron(hb_term_chan, closer)
+
 	for _, o := range p.cluster_info {
-		wg.Add(1)
-		go p.TransLog(o, translog_chan, tmp_stop_chan, &wg)
+		closer.AddOne()
+		go p.TransLog(o, translog_chan, closer)
 	}
 
 	// TODO(deyukong): we must guarentee that master's term is invariant before the local channels terminates.
 	// otherwise, the two goroutines will use the true-leader's(other than me) term to send hb or logentries
-	// to followers. which in fact is a byzantine-situation.
-	new_term := p.current_term
-	var delayed_grantvote func() = nil
-
+	// to followers. which in fact is a byzantine-situation. so we donot change current_term until this loop
+	// exits.
 	// cleanup goroutines, be very careful about channel cyclic-dependency, alive-locks
 	defer func() {
-		close(tmp_stop_chan)
-		// TODO(deyukong): stop translog channels
-		wg_chan := make(chan int)
-		go func() {
-			wg.Wait()
-			close(wg_chan)
-		}()
+		closer.SignalAndAsyncWait()
 		for {
 			// no need to handle new_entry_pair and vote_pair, they are global and
 			// every loop will handle these two pairs, but hb_term_chan and {???} are
@@ -234,7 +295,7 @@ func (p *PeerServer) LeaderCron() {
 			select {
 			case tmp := <-hb_term_chan:
 				log.Infof("ignore msg:%d from hb_term_chan since master stepping down", tmp)
-			case <-wg_chan:
+			case <-closer.CloseCompleted():
 				log.Infof("hb channel and translog channels are all closed, leader stepdown finish")
 				if new_term > p.current_term {
 					p.ChangeState(pb.PeerState_Follower)
@@ -261,19 +322,19 @@ func (p *PeerServer) LeaderCron() {
 			} else {
 				log.Debugf("leader term:%d got hb:%d smaller", p.current_term, tmp)
 			}
-        case tmp := <-translog_chan:
+		case tmp := <-translog_chan:
 			if tmp.res.Term > p.current_term {
 				log.Infof("leader term:%d got[%s] translog monotonic term:%d, turn follower",
-                    p.current_term, tmp.id, tmp.res.Term)
-                if tmp.res.Result == int32(AE_OK) {
-                    log.Fatalf("leader term:%d got[%s] invalid translog result:%v",
-                        p.current_term, tmp.id, tmp.res)
-                }
+					p.current_term, tmp.id, tmp.res.Term)
+				if tmp.res.Result == int32(AE_OK) {
+					log.Fatalf("leader term:%d got[%s] invalid translog result:%v",
+						p.current_term, tmp.id, tmp.res)
+				}
 				new_term = tmp.res.Term
 				return
 			} else {
 				log.Debugf("leader term:%d got[%s] hb:%d smaller", p.current_term, tmp.id, tmp.res.Term)
-                p.ForwardCommitIndex()
+				p.ForwardCommitIndex(commit_fwder, tmp)
 			}
 		case tmp := <-p.new_entry_pair.input:
 			if p.current_term > tmp.Term {

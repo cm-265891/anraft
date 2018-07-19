@@ -69,15 +69,28 @@ type VotePair struct {
 }
 
 type AeWrapper struct {
-	id        string
-	res       *pb.AppendEntriesRes
-	idx int64
-    term int64
+	id  string
+	res *pb.AppendEntriesRes
+	it  *IndexAndTerm
 }
 
 type IndexAndTerm struct {
-    idx int64
-    term int64
+	idx  int64
+	term int64
+}
+
+type IndexAndTerms []*IndexAndTerm
+
+func (its IndexAndTerms) Len() int {
+	return len(its)
+}
+
+func (its IndexAndTerms) Less(i, j int) bool {
+	return its[i].idx < its[j].idx
+}
+
+func (its IndexAndTerms) Swap(i, j int) {
+	its[i], its[j] = its[j], its[i]
 }
 
 func (p *PeerInfo) Init(id string, host string) error {
@@ -260,6 +273,12 @@ func (p *PeerServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq
 		return p.AppendEntries(ctx, req)
 	}
 	return pipe_output, nil
+}
+
+func (p *PeerServer) GetCommitIndex() int64 {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	return p.commit_index
 }
 
 func (p *PeerServer) UpdateCommitIndex(idx int64) {
