@@ -311,7 +311,7 @@ func (p *PeerServer) LeaderCron() {
 
 	for {
 		select {
-		case <-p.close_chan:
+		case <-p.closer.HasBeenClosed():
 			log.Infof("leader cron stops...")
 			return
 		case tmp := <-hb_term_chan:

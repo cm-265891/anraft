@@ -19,7 +19,7 @@ func (p *PeerServer) FollowerCron() {
 	tchan := time.After(p.election_timeout)
 	for {
 		select {
-		case <-p.close_chan:
+		case <-p.closer.HasBeenClosed():
 			log.Infof("follower cron stops...")
 			return
 		case <-tchan:

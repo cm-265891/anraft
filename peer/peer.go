@@ -3,6 +3,7 @@ package peer
 import (
 	pb "anraft/proto/peer_proto"
 	"anraft/storage"
+	"anraft/utils"
 	"fmt"
 	"github.com/ngaut/log"
 	context "golang.org/x/net/context"
@@ -126,7 +127,7 @@ type PeerServer struct {
 	store          *PeerStorage
 	new_entry_pair *NewEntryPair
 	vote_pair      *VotePair
-	close_chan     chan int
+	closer         *utils.Closer
 	/* the name of election_timeout is from 5.2 */
 	/* if a follower receives on communication over a period of time */
 	/* called the election timeout, then ...... */
@@ -136,7 +137,7 @@ type PeerServer struct {
 
 func (p *PeerServer) Init(my_id, my_host string, hosts map[string]string,
 	store_engine storage.Storage, etime time.Duration) error {
-	if _, ok := hosts[my_host]; !ok {
+	if _, ok := hosts[my_id]; !ok {
 		return fmt.Errorf("self should be in cluster")
 	}
 	p.host = my_host
@@ -160,7 +161,7 @@ func (p *PeerServer) Init(my_id, my_host string, hosts map[string]string,
 		input:  make(chan *pb.RequestVoteReq),
 		output: make(chan *pb.RequestVoteRes),
 	}
-	p.close_chan = make(chan int)
+	p.closer = utils.NewCloser()
 	p.store = &PeerStorage{}
 	p.store.Init(store_engine)
 
@@ -174,6 +175,7 @@ func (p *PeerServer) Init(my_id, my_host string, hosts map[string]string,
 	if p.commit_index, err = p.store.GetCommitIndex(); err != nil {
 		return err
 	}
+	p.closer.AddOne()
 	go p.RoleManageThd()
 	return nil
 }
@@ -185,7 +187,14 @@ func (p *PeerServer) HeartBeat(context.Context, *pb.HeartBeatReq) (*pb.HeartBeat
 // NOTE(deyukong): to make the thread model simple, we only allow RoleManageThd thread to change
 // peer's state, other threads communicate with this thread
 func (p *PeerServer) RoleManageThd() {
+	defer p.closer.Done()
 	for {
+		select {
+		case <-p.closer.HasBeenClosed():
+			log.Infof("process shutting down...")
+			return
+		default: // nothing
+		}
 		if p.state == pb.PeerState_Follower {
 			p.FollowerCron()
 		} else if p.state == pb.PeerState_Leader {
@@ -371,4 +380,10 @@ func (p *PeerServer) ChangeState(s pb.PeerState) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 	p.changeStateInLock(s)
+}
+
+func (p *PeerServer) Stop() {
+	log.Infof("server stops")
+	p.closer.SignalAndWait()
+	log.Infof("server stops done")
 }

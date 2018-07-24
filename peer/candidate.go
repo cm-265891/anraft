@@ -56,6 +56,7 @@ func (p *PeerServer) Elect() {
 	go func() {
 		wg.Wait()
 		close(wchan)
+		close(vote_chan)
 	}()
 
 	for {
@@ -103,7 +104,7 @@ func (p *PeerServer) Elect() {
 				}
 				return
 			}
-		case <-p.close_chan:
+		case <-p.closer.HasBeenClosed():
 			return
 		}
 	}
@@ -127,6 +128,7 @@ WAIT_ELECT_FOR_END:
 			}
 		}
 	}
+
 	// see paper chaptor-5, rules for all servers
 	// if rpc request or response contains term T > currentTerm,
 	// update currentTerm to T and conver to follower
@@ -197,7 +199,7 @@ WAIT_ELECT_FOR_END:
 					}
 					return
 				}
-			case <-p.close_chan:
+			case <-p.closer.HasBeenClosed():
 				return
 			}
 		}

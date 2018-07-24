@@ -14,11 +14,10 @@ type TestContext struct {
 	engine storage.Storage
 	dir    string
 	api    *PeerStorage
+	svr    *PeerServer
 }
 
-var test_ctx *TestContext = nil
-
-func startup(t *testing.T) {
+func startup_peer_storage_test(t *testing.T) *TestContext {
 	result := &TestContext{}
 	tmp := &badger.BadgerEngine{}
 	result.dir = fmt.Sprintf("/tmp/%s", utils.RandStringRunes(16))
@@ -28,15 +27,15 @@ func startup(t *testing.T) {
 	result.engine = tmp
 	result.api = &PeerStorage{}
 	result.api.Init(result.engine)
-	test_ctx = result
+	return result
 }
 
-func teardown(t *testing.T) {
+func teardown_peer_storage_test(t *testing.T, test_ctx *TestContext) {
 	test_ctx.engine.Close()
 	os.RemoveAll(test_ctx.dir)
 }
 
-func test_term(t *testing.T) {
+func test_term(t *testing.T, test_ctx *TestContext) {
 	term, err := test_ctx.api.GetTerm()
 	if err != nil {
 		t.Errorf("getTerm failed:%v", err)
@@ -58,7 +57,7 @@ func test_term(t *testing.T) {
 	}
 }
 
-func test_vote_for(t *testing.T) {
+func test_vote_for(t *testing.T, test_ctx *TestContext) {
 	vote_for, err := test_ctx.api.GetVoteFor()
 	if err != nil {
 		t.Errorf("GetVoteFor failed:%v", err)
@@ -80,7 +79,7 @@ func test_vote_for(t *testing.T) {
 	}
 }
 
-func test_commit_idx(t *testing.T) {
+func test_commit_idx(t *testing.T, test_ctx *TestContext) {
 	commit_idx, err := test_ctx.api.GetCommitIndex()
 	if err != nil {
 		t.Errorf("GetCommitIndex failed:%v", err)
@@ -102,18 +101,26 @@ func test_commit_idx(t *testing.T) {
 	}
 }
 
-func test_log(t *testing.T) {
+func test_log(t *testing.T, test_ctx *TestContext) {
 	_, err := test_ctx.api.GetLogEntry(1)
 	if err != storage.ErrKeyNotFound {
 		t.Errorf("GetLogEntry failed:%v", err)
 		return
 	}
+
+	entry, err := test_ctx.api.GetLastLogEntry()
+	if entry != nil || err != nil {
+		t.Errorf("GetLastLogEntry on empty set not pass")
+		return
+	}
+
 	it := test_ctx.api.SeekLogAt(1)
 	defer it.Close()
 	if it.ValidForPrefix(LOG_PREFIX) {
 		t.Errorf("iterator should not work to empty data")
 		return
 	}
+
 	err = test_ctx.api.AppendLogEntry(&pb.LogEntry{
 		Index: 1,
 		Term:  1,
@@ -123,6 +130,19 @@ func test_log(t *testing.T) {
 	if err != nil {
 		t.Errorf("append entry 1 failed:%v", err)
 	}
+
+	_, err = test_ctx.api.GetLogEntry(1)
+	if err != nil {
+		t.Errorf("GetLogEntry failed:%v", err)
+		return
+	}
+
+	entry, err = test_ctx.api.GetLastLogEntry()
+	if err != nil || entry.Index != 1 {
+		t.Errorf("GetLastLogEntry index not 1")
+		return
+	}
+
 	err = test_ctx.api.AppendLogEntry(&pb.LogEntry{
 		Index: 2,
 		Term:  1,
@@ -132,10 +152,21 @@ func test_log(t *testing.T) {
 	if err != nil {
 		t.Errorf("append entry 2 failed:%v", err)
 	}
+
+	entry, err = test_ctx.api.GetLastLogEntry()
+	if err != nil || entry.Index != 2 {
+		t.Errorf("GetLastLogEntry index not 2")
+		return
+	}
+
 	it1 := test_ctx.api.SeekLogAt(0)
 	defer it1.Close()
 	it1_cnt := 0
 	for it1.ValidForPrefix(LOG_PREFIX) {
+		_, err := IterEntry2Log(it1)
+		if err != nil {
+			t.Errorf("IterEntry2Log should not fail")
+		}
 		it1_cnt += 1
 		it1.Next()
 	}
@@ -146,6 +177,10 @@ func test_log(t *testing.T) {
 	defer it2.Close()
 	it2_cnt := 0
 	for it2.ValidForPrefix(LOG_PREFIX) {
+		_, err := IterEntry2Log(it2)
+		if err != nil {
+			t.Errorf("IterEntry2Log should not fail")
+		}
 		it2_cnt += 1
 		it2.Next()
 	}
@@ -156,6 +191,10 @@ func test_log(t *testing.T) {
 	defer it3.Close()
 	it3_cnt := 0
 	for it3.ValidForPrefix(LOG_PREFIX) {
+		_, err := IterEntry2Log(it3)
+		if err != nil {
+			t.Errorf("IterEntry2Log should not fail")
+		}
 		it3_cnt += 1
 		it3.Next()
 	}
@@ -166,19 +205,36 @@ func test_log(t *testing.T) {
 	defer it4.Close()
 	it4_cnt := 0
 	for it4.ValidForPrefix(LOG_PREFIX) {
+		_, err := IterEntry2Log(it4)
+		if err != nil {
+			t.Errorf("IterEntry2Log should not fail")
+		}
 		it4_cnt += 1
 		it4.Next()
 	}
 	if it4_cnt != 0 {
 		t.Errorf("it4_cnt should be 0")
 	}
+
+	err = test_ctx.api.DelLogEntry(&pb.LogEntry{
+		Index: 2,
+	})
+	if err != nil {
+		t.Errorf("del logentry:2 failed:%v", err)
+		return
+	}
+	entry, err = test_ctx.api.GetLastLogEntry()
+	if err != nil || entry.Index != 1 {
+		t.Errorf("GetLastLogEntry index not 1")
+		return
+	}
 }
 
 func TestStorage(t *testing.T) {
-	startup(t)
-	defer teardown(t)
-	t.Run("test_term", test_term)
-	t.Run("test_vote_for", test_vote_for)
-	t.Run("test_commit_idx", test_commit_idx)
-	t.Run("test_log", test_log)
+	ctx := startup_peer_storage_test(t)
+	defer teardown_peer_storage_test(t, ctx)
+	test_term(t, ctx)
+	test_vote_for(t, ctx)
+	test_commit_idx(t, ctx)
+	test_log(t, ctx)
 }

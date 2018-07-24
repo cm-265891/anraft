@@ -1,0 +1,1480 @@
+
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+		<style>
+			body {
+				background: black;
+				color: rgb(80, 80, 80);
+			}
+			body, pre, #legend span {
+				font-family: Menlo, monospace;
+				font-weight: bold;
+			}
+			#topbar {
+				background: black;
+				position: fixed;
+				top: 0; left: 0; right: 0;
+				height: 42px;
+				border-bottom: 1px solid rgb(80, 80, 80);
+			}
+			#content {
+				margin-top: 50px;
+			}
+			#nav, #legend {
+				float: left;
+				margin-left: 10px;
+			}
+			#legend {
+				margin-top: 12px;
+			}
+			#nav {
+				margin-top: 10px;
+			}
+			#legend span {
+				margin: 0 5px;
+			}
+			.cov0 { color: rgb(192, 0, 0) }
+.cov1 { color: rgb(128, 128, 128) }
+.cov2 { color: rgb(116, 140, 131) }
+.cov3 { color: rgb(104, 152, 134) }
+.cov4 { color: rgb(92, 164, 137) }
+.cov5 { color: rgb(80, 176, 140) }
+.cov6 { color: rgb(68, 188, 143) }
+.cov7 { color: rgb(56, 200, 146) }
+.cov8 { color: rgb(44, 212, 149) }
+.cov9 { color: rgb(32, 224, 152) }
+.cov10 { color: rgb(20, 236, 155) }
+
+		</style>
+	</head>
+	<body>
+		<div id="topbar">
+			<div id="nav">
+				<select id="files">
+				
+				<option value="file0">anraft/peer/candidate.go (65.5%)</option>
+				
+				<option value="file1">anraft/peer/follower.go (8.9%)</option>
+				
+				<option value="file2">anraft/peer/leader.go (0.0%)</option>
+				
+				<option value="file3">anraft/peer/peer.go (36.6%)</option>
+				
+				<option value="file4">anraft/peer/peer_storage.go (81.0%)</option>
+				
+				</select>
+			</div>
+			<div id="legend">
+				<span>not tracked</span>
+			
+				<span class="cov0">not covered</span>
+				<span class="cov8">covered</span>
+			
+			</div>
+		</div>
+		<div id="content">
+		
+		<pre class="file" id="file0" style="display: none">package peer
+
+import (
+        pb "anraft/proto/peer_proto"
+        "fmt"
+        "github.com/ngaut/log"
+        context "golang.org/x/net/context"
+        "math/rand"
+        "sync"
+        "time"
+)
+
+// NOTE(deyukong): this is run in a temp thread, never touch shared states
+func requestVote(p *PeerInfo, term int64, timeout time.Duration,
+        last_entry *pb.LogEntry, channel chan *pb.RequestVoteRes, wg *sync.WaitGroup) <span class="cov8" title="1">{
+        defer wg.Done()
+        req := new(pb.RequestVoteReq)
+        req.Header = new(pb.ReqHeader)
+        req.Term = term
+        req.CandidateId = p.id
+        req.LastLogIndex = -1
+        req.LastLogTerm = -1
+        if last_entry != nil </span><span class="cov0" title="0">{
+                req.LastLogIndex = last_entry.Index
+                req.LastLogTerm = last_entry.Term
+        }</span>
+        <span class="cov8" title="1">ctx, _ := context.WithTimeout(context.Background(), timeout)
+        rsp, err := p.client.RequestVote(ctx, req)
+        if err != nil </span><span class="cov8" title="1">{
+                log.Errorf("request vote:%v failed:%v", req, err)
+                return
+        }</span>
+        <span class="cov0" title="0">channel &lt;- rsp</span>
+}
+
+func (p *PeerServer) Elect() <span class="cov8" title="1">{
+        // TODO(deyukong): the rule to modify state
+        p.ChangeState(pb.PeerState_Candidate)
+        vote_chan := make(chan *pb.RequestVoteRes, len(p.cluster_info))
+
+        new_term := p.VoteForSelf(vote_chan)
+        log.Infof("begin a new election with new_term:%d", new_term)
+        var wg sync.WaitGroup
+        wchan := make(chan int)
+        last_entry, err := p.store.GetLastLogEntry()
+        if err != nil </span><span class="cov0" title="0">{
+                log.Fatalf("get last entry failed:%v", err)
+        }</span>
+        <span class="cov8" title="1">for _, o := range p.cluster_info </span><span class="cov8" title="1">{
+                if o.host == p.host </span><span class="cov8" title="1">{
+                        continue</span>
+                }
+                <span class="cov8" title="1">wg.Add(1)
+                go requestVote(o, new_term, p.election_timeout, last_entry, vote_chan, &amp;wg)</span>
+        }
+        <span class="cov8" title="1">go func() </span><span class="cov8" title="1">{
+                wg.Wait()
+                close(wchan)
+        close(vote_chan)
+        }</span>()
+
+        <span class="cov8" title="1">for </span><span class="cov8" title="1">{
+                select </span>{
+                case &lt;-wchan:<span class="cov8" title="1">
+                        log.Infof("elect term:%d collect vote done", new_term)
+                        goto WAIT_ELECT_FOR_END</span>
+                case tmp := &lt;-p.new_entry_pair.input:<span class="cov0" title="0">
+                        if new_term &gt; tmp.Term </span><span class="cov0" title="0">{
+                                log.Infof("elect term:%d got entry with smaller term:%d, keep wait", new_term, tmp.Term)
+                                p.new_entry_pair.output &lt;- &amp;pb.AppendEntriesRes{
+                                        Header: new(pb.ResHeader),
+                                        Result: int32(AE_SMALL_TERM),
+                                        Msg:    fmt.Sprintf("reqterm:%d smaller than candidate:%d", tmp.Term, new_term),
+                                        Term:   new_term,
+                                }
+                        }</span> else<span class="cov0" title="0"> {
+                                log.Infof("elect term:%d got entry monotonic term:%d, turn to follower", new_term, tmp.Term)
+                                p.UpdateTerm(tmp.Term)
+                                p.ChangeState(pb.PeerState_Follower)
+                                p.new_entry_pair.output &lt;- &amp;pb.AppendEntriesRes{
+                                        Header: new(pb.ResHeader),
+                                        Result: int32(AE_RETRY),
+                                        Msg:    "",
+                                        Term:   p.current_term,
+                                }
+                                return
+                        }</span>
+                case tmp := &lt;-p.vote_pair.input:<span class="cov0" title="0">
+                        if ok, reason := p.GrantVote(tmp); !ok </span><span class="cov0" title="0">{
+                                log.Infof("elect term:%d got vote, now_term:%d not grant:%s", new_term, p.current_term, reason)
+                                p.vote_pair.output &lt;- &amp;pb.RequestVoteRes{
+                                        Header:      new(pb.ResHeader),
+                                        VoteGranted: p.vote_for,
+                                        // although vote not granted, it is still guaranteed that if other's term is greater,
+                                        // ours is also updated to other's
+                                        Term: p.current_term,
+                                }
+                        }</span> else<span class="cov0" title="0"> {
+                                log.Infof("elect term:%d got vote and granted, current_term:%d", new_term, p.current_term)
+                                p.vote_pair.output &lt;- &amp;pb.RequestVoteRes{
+                                        Header:      new(pb.ResHeader),
+                                        VoteGranted: p.vote_for,
+                                        Term:        p.current_term,
+                                }
+                                return
+                        }</span>
+                case &lt;-p.closer.HasBeenClosed():<span class="cov0" title="0">
+                        return</span>
+                }
+        }
+
+WAIT_ELECT_FOR_END:
+
+        <span class="cov8" title="1">max_term := new_term
+        same_term_map := make(map[string]int)
+        for o := range vote_chan </span><span class="cov8" title="1">{
+                if o.Term &lt; new_term </span><span class="cov0" title="0">{
+                        log.Fatalf("RequestVote rep see term:%d less than mine:%d", o.Term, new_term)
+                }</span>
+                <span class="cov8" title="1">if o.Term &gt; max_term </span><span class="cov0" title="0">{
+                        max_term = o.Term
+                }</span>
+                <span class="cov8" title="1">if o.Term == new_term </span><span class="cov8" title="1">{
+                        if _, ok := same_term_map[o.VoteGranted]; ok </span><span class="cov0" title="0">{
+                                same_term_map[o.VoteGranted] += 1
+                        }</span> else<span class="cov8" title="1"> {
+                                same_term_map[o.VoteGranted] = 1
+                        }</span>
+                }
+        }
+
+        // see paper chaptor-5, rules for all servers
+        // if rpc request or response contains term T &gt; currentTerm,
+        // update currentTerm to T and conver to follower
+        <span class="cov8" title="1">if max_term &gt; new_term </span><span class="cov0" title="0">{
+                p.UpdateTerm(max_term)
+                p.state = pb.PeerState_Follower
+                return
+        }</span>
+
+        <span class="cov8" title="1">majority_id := ""
+        for id, num := range same_term_map </span><span class="cov8" title="1">{
+                if num &gt;= len(p.cluster_info)/2+1 </span><span class="cov0" title="0">{
+                        if majority_id == "" </span><span class="cov0" title="0">{
+                                majority_id = id
+                        }</span> else<span class="cov0" title="0"> {
+                                log.Fatalf("term:%d have two ids:%s,%s got major votes", new_term, majority_id, id)
+                        }</span>
+                }
+        }
+        <span class="cov8" title="1">if majority_id == "" </span>{
+                // [0, 2) * p.election_timeout
+                nanocount := int64(p.election_timeout / time.Nanosecond)
+                sleep := time.Duration(int64(2*rand.Float64()*float64(nanocount))) * time.Nanosecond
+                log.Infof("elect draw, sleep for:%v and retry", sleep)
+                tchan := time.After(sleep)
+                for {
+                        select {
+                        case &lt;-tchan:
+                                p.Elect()
+                                return
+                        case tmp := &lt;-p.new_entry_pair.input:
+                                if new_term &gt; tmp.Term {
+                                        log.Infof("elect term:%d got entry with smaller term:%d, keep wait", new_term, tmp.Term)
+                                        p.new_entry_pair.output &lt;- &amp;pb.AppendEntriesRes{
+                                                Header: new(pb.ResHeader),
+                                                Result: int32(AE_SMALL_TERM),
+                                                Msg:    fmt.Sprintf("reqterm:%d smaller than candidate:%d", tmp.Term, new_term),
+                                                Term:   new_term,
+                                        }
+                                } else {
+                                        log.Infof("elect term:%d got entry with monotonic term:%d, turn follower", new_term, tmp.Term)
+                                        p.UpdateTerm(tmp.Term)
+                                        p.ChangeState(pb.PeerState_Follower)
+                                        p.new_entry_pair.output &lt;- &amp;pb.AppendEntriesRes{
+                                                Header: new(pb.ResHeader),
+                                                Result: int32(AE_RETRY),
+                                                Msg:    "",
+                                                Term:   p.current_term,
+                                        }
+                                        return
+                                }
+                        case tmp := &lt;-p.vote_pair.input:
+                                if ok, reason := p.GrantVote(tmp); !ok {
+                                        log.Infof("elect term:%d got vote, now_term:%d not grant:%s", new_term, p.current_term, reason)
+                                        p.vote_pair.output &lt;- &amp;pb.RequestVoteRes{
+                                                Header:      new(pb.ResHeader),
+                                                VoteGranted: p.vote_for,
+                                                // although vote not granted, it is still guaranteed that if other's term is greater,
+                                                // ours is also updated to other's
+                                                Term: p.current_term,
+                                        }
+                                } else {
+                                        log.Infof("elect term:%d got vote and granted, current_term:%d", new_term, p.current_term)
+                                        p.vote_pair.output &lt;- &amp;pb.RequestVoteRes{
+                                                Header:      new(pb.ResHeader),
+                                                VoteGranted: p.vote_for,
+                                                Term:        p.current_term,
+                                        }
+                                        return
+                                }
+                        case &lt;-p.closer.HasBeenClosed():
+                                return
+                        }
+                }
+        } else if majority_id == p.id {
+                p.ChangeState(pb.PeerState_Leader)
+        } else {
+                p.ChangeState(pb.PeerState_Follower)
+        }
+}
+
+func (p *PeerServer) VoteForSelf(channel chan *pb.RequestVoteRes) int64 <span class="cov8" title="1">{
+        p.mutex.Lock()
+        defer p.mutex.Unlock()
+        if err := p.updateTermInLock(p.current_term + 1); err != nil </span><span class="cov0" title="0">{
+                log.Fatalf("incrTermInLock failed:%v", err)
+        }</span>
+        <span class="cov8" title="1">if err := p.voteInLock(p.id); err != nil </span><span class="cov0" title="0">{
+                log.Fatalf("voteInLock failed:%v", err)
+        }</span>
+        <span class="cov8" title="1">rsp := new(pb.RequestVoteRes)
+        rsp.Header = new(pb.ResHeader)
+        rsp.Term = p.current_term
+        rsp.VoteGranted = p.id
+        channel &lt;- rsp
+        return p.current_term</span>
+}
+</pre>
+		
+		<pre class="file" id="file1" style="display: none">package peer
+
+import (
+        pb "anraft/proto/peer_proto"
+        "anraft/storage"
+        "anraft/utils"
+        "github.com/ngaut/log"
+        "time"
+)
+
+func (p *PeerServer) ElecTimeout() <span class="cov8" title="1">{
+        if p.state != pb.PeerState_Follower </span><span class="cov0" title="0">{
+                log.Fatalf("ElecTimeout in wrong state:%v", p.state)
+        }</span>
+        <span class="cov8" title="1">p.Elect()</span>
+}
+
+func (p *PeerServer) FollowerCron() <span class="cov8" title="1">{
+        tchan := time.After(p.election_timeout)
+        for </span><span class="cov8" title="1">{
+                select </span>{
+                case &lt;-p.closer.HasBeenClosed():<span class="cov0" title="0">
+                        log.Infof("follower cron stops...")
+                        return</span>
+                case &lt;-tchan:<span class="cov8" title="1">
+                        p.ElecTimeout()
+                        return</span>
+                case tmp := &lt;-p.new_entry_pair.input:<span class="cov0" title="0">
+                        p.new_entry_pair.output &lt;- p.appendNewEntries(tmp)
+                        tchan = time.After(p.election_timeout)</span>
+                case tmp := &lt;-p.vote_pair.input:<span class="cov0" title="0">
+                        if ok, reason := p.GrantVote(tmp); !ok </span><span class="cov0" title="0">{
+                                log.Infof("follower got vote, now_term:%d not grant:%s", p.current_term, reason)
+                                p.vote_pair.output &lt;- &amp;pb.RequestVoteRes{
+                                        Header:      new(pb.ResHeader),
+                                        VoteGranted: p.vote_for,
+                                        // although vote not granted, it is still guaranteed that if other's term is greater,
+                                        // ours is also updated to other's
+                                        Term: p.current_term,
+                                }
+                        }</span> else<span class="cov0" title="0"> {
+                                log.Infof("follower got vote and granted, current_term:%d", p.current_term)
+                                p.vote_pair.output &lt;- &amp;pb.RequestVoteRes{
+                                        Header:      new(pb.ResHeader),
+                                        VoteGranted: p.vote_for,
+                                        Term:        p.current_term,
+                                }
+                        }</span>
+                }
+        }
+}
+
+// TODO(deyukong): check about my commit-point and first-log
+func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEntriesRes <span class="cov0" title="0">{
+        // it's the upper logic's duty to guarantee the correct role at this point
+        if p.state != pb.PeerState_Follower </span><span class="cov0" title="0">{
+                log.Fatalf("append entry but role[%v] not follower", p.state)
+        }</span>
+        <span class="cov0" title="0">if p.current_term &gt; entries.Term </span><span class="cov0" title="0">{
+                log.Infof("append entry but smaller term[%d:%d]", p.current_term, entries.Term)
+                return &amp;pb.AppendEntriesRes{
+                        Header: new(pb.ResHeader),
+                        Term:   p.current_term,
+                        Result: int32(AE_SMALL_TERM),
+                }
+        }</span>
+
+        <span class="cov0" title="0">p.UpdateTerm(entries.Term)
+        if len(entries.Entries) == 0 </span><span class="cov0" title="0">{
+                // heartbeat
+                return &amp;pb.AppendEntriesRes{
+                        Header: new(pb.ResHeader),
+                        Term:   p.current_term,
+                        Result: int32(AE_OK),
+                }
+        }</span>
+
+        <span class="cov0" title="0">var iter storage.Iterator = nil
+        if entries.PrevLogIndex == -1 </span><span class="cov0" title="0">{
+                // NOTE(deyukong): currently, committed logs are not archieved, so seek from 0
+                iter = p.store.SeekLogAt(0)
+                defer iter.Close()
+        }</span> else<span class="cov0" title="0"> {
+                iter = p.store.SeekLogAt(entries.PrevLogIndex)
+                defer iter.Close()
+
+                // seek to the end
+                if !iter.ValidForPrefix(LOG_PREFIX) </span><span class="cov0" title="0">{
+                        return &amp;pb.AppendEntriesRes{
+                                Header: new(pb.ResHeader),
+                                Term:   entries.Term,
+                                Result: int32(AE_TERM_UNMATCH),
+                        }
+                }</span>
+                <span class="cov0" title="0">entry, err := IterEntry2Log(iter)
+                if err != nil </span><span class="cov0" title="0">{
+                        log.Fatalf("idx:%d parse rawlog to logentry failed:%v", entries.PrevLogIndex, err)
+                }</span>
+                // entry not match
+                <span class="cov0" title="0">if entry.Term != entries.PrevLogTerm </span><span class="cov0" title="0">{
+                        log.Warnf("master[%s] entry:[%d:%d] not match mine[%d:%d]",
+                                entries.LeaderId, entries.PrevLogIndex, entries.PrevLogTerm, entry.Index, entry.Term)
+                        return &amp;pb.AppendEntriesRes{
+                                Header: new(pb.ResHeader),
+                                Term:   entries.Term,
+                                Result: int32(AE_TERM_UNMATCH),
+                        }
+                }</span>
+                // prev_entry matches, move iter to the next
+                <span class="cov0" title="0">iter.Next()</span>
+        }
+
+        // at most times, code reaches here with iter invalid
+        <span class="cov0" title="0">if iter.ValidForPrefix(LOG_PREFIX) </span><span class="cov0" title="0">{
+                log.Warnf("master[%s] replays old log:[%d:%d]",
+                        entries.LeaderId, entries.PrevLogIndex, entries.PrevLogTerm)
+        }</span>
+
+        // set apply_from default to len(entries.Entries), if all matches, we have nothing to apply
+        <span class="cov0" title="0">apply_from := len(entries.Entries)
+        has_conflict := false
+        for idx, master_entry := range entries.Entries </span><span class="cov0" title="0">{
+                // seek to the end
+                if !iter.ValidForPrefix(LOG_PREFIX) </span><span class="cov0" title="0">{
+                        apply_from = idx
+                        break</span>
+                }
+                <span class="cov0" title="0">entry, err := IterEntry2Log(iter)
+                if err != nil </span><span class="cov0" title="0">{
+                        // NOTE(deyukong): master_entry.Index is not mine, but it should be the same,
+                        // just for problem-tracking
+                        log.Fatalf("idx:%d parse rawlog to logentry failed:%v", master_entry.Index, err)
+                }</span>
+                <span class="cov0" title="0">if entry.Index != master_entry.Index </span><span class="cov0" title="0">{
+                        log.Fatalf("bug:master[%s] entry:[%d:%d] index defers from  mine[%d:%d]",
+                                entries.LeaderId, entries.PrevLogIndex, entries.PrevLogTerm, entry.Index, entry.Term)
+                }</span>
+                <span class="cov0" title="0">if entry.Term != master_entry.Term </span><span class="cov0" title="0">{
+                        apply_from = idx
+                        has_conflict = true
+                        break</span>
+                }
+                // entry.Term == master_entry.Term
+                <span class="cov0" title="0">iter.Next()</span>
+        }
+
+        // at most times, code reaches here with iter invalid
+        <span class="cov0" title="0">for ; has_conflict &amp;&amp; iter.ValidForPrefix(LOG_PREFIX); iter.Next() </span><span class="cov0" title="0">{
+                entry, err := IterEntry2Log(iter)
+                if err != nil </span><span class="cov0" title="0">{
+                        log.Fatalf("logentry parse failed:%v", err)
+                }</span>
+                <span class="cov0" title="0">if err := p.store.DelLogEntry(entry); err != nil </span><span class="cov0" title="0">{
+                        log.Fatalf("del logentry:%v failed:%v", entry, err)
+                }</span> else<span class="cov0" title="0"> {
+                        log.Infof("logentry:%v remove succ", entry)
+                }</span>
+        }
+
+        <span class="cov0" title="0">for i := apply_from; i &lt; len(entries.Entries); i++ </span><span class="cov0" title="0">{
+                if err := p.store.AppendLogEntry(entries.Entries[i]); err != nil </span><span class="cov0" title="0">{
+                        log.Fatalf("apply entry:%v to store failed:%v", entries.Entries[i], err)
+                }</span> else<span class="cov0" title="0"> {
+                        log.Infof("apply entry:%v to store success", entries.Entries[i])
+                }</span>
+        }
+
+        // update my commit index
+        <span class="cov0" title="0">if p.commit_index &gt; entries.LeaderCommit </span><span class="cov0" title="0">{
+                log.Fatalf("my commitidx:%d shouldnt be greater than master's:%d", p.commit_index, entries.LeaderCommit)
+        }</span>
+
+        <span class="cov0" title="0">new_commit := utils.Int64Min(entries.LeaderCommit, entries.Entries[len(entries.Entries)-1].Index)
+        // it may happens when master re-apply old logs which have already been applied.
+        if new_commit &lt; p.commit_index </span><span class="cov0" title="0">{
+                last_entry, err := p.store.GetLastLogEntry()
+                if err != nil || last_entry == nil </span><span class="cov0" title="0">{
+                        log.Fatalf("get last entry failed:%v", err)
+                }</span>
+                <span class="cov0" title="0">log.Warnf("new_commit:%d less than mine:%d, last_idx:%d", new_commit, p.commit_index, last_entry.Index)</span>
+        } else<span class="cov0" title="0"> {
+                // commit_idx should be monotonic
+                p.UpdateCommitIndex(new_commit)
+        }</span>
+        <span class="cov0" title="0">return &amp;pb.AppendEntriesRes{
+                Header: new(pb.ResHeader),
+                Term:   entries.Term,
+                Result: int32(AE_OK),
+        }</span>
+}
+</pre>
+		
+		<pre class="file" id="file2" style="display: none">package peer
+
+import (
+        pb "anraft/proto/peer_proto"
+        "anraft/utils"
+        "fmt"
+        "github.com/ngaut/log"
+        context "golang.org/x/net/context"
+        "sort"
+        "sync"
+        "time"
+)
+
+func heartBeat(p *PeerInfo, term int64, id string, commit_idx int64, timeout time.Duration,
+        hb_chan chan *AeWrapper, wg *sync.WaitGroup) <span class="cov0" title="0">{
+        defer wg.Done()
+        req := new(pb.AppendEntriesReq)
+        req.Header = new(pb.ReqHeader)
+        req.Term = term
+        req.LeaderId = id
+        req.LeaderCommit = commit_idx
+        req.PrevLogIndex = -1
+        req.PrevLogTerm = -1
+        ctx, _ := context.WithTimeout(context.Background(), timeout)
+        rsp, err := p.client.AppendEntries(ctx, req)
+        if err != nil </span><span class="cov0" title="0">{
+                log.Errorf("heartbeat:%v failed:%v", req, err)
+                return
+        }</span>
+        <span class="cov0" title="0">hb_chan &lt;- &amp;AeWrapper{
+                id:  id,
+                res: rsp,
+                it:  nil, // idx and term not used for heartbeat
+        }</span>
+}
+
+// term is raft's term, not terminate
+func (p *PeerServer) LeaderHeartBeatCron(term_chan chan int64, closer *utils.Closer) <span class="cov0" title="0">{
+        defer closer.Done()
+        for </span><span class="cov0" title="0">{
+                select </span>{
+                case &lt;-closer.HasBeenClosed():<span class="cov0" title="0">
+                        log.Infof("leader hb stops...")
+                        return</span>
+                case &lt;-time.After(p.election_interval):<span class="cov0" title="0">
+                        current_term := p.GetTerm()
+                        hb_chan := make(chan *AeWrapper, len(p.cluster_info)-1)
+                        var wg sync.WaitGroup
+                        for _, o := range p.cluster_info </span><span class="cov0" title="0">{
+                                if o.host == p.host </span><span class="cov0" title="0">{
+                                        continue</span>
+                                }
+                                <span class="cov0" title="0">wg.Add(1)
+                                go heartBeat(o, current_term, p.id, p.commit_index, p.election_interval, hb_chan, &amp;wg)</span>
+                        }
+                        <span class="cov0" title="0">wg.Wait()
+                        max_term := current_term
+                        // NOTE(deyukong): from the aspect of symmetry, master should stepdown if it does not receive
+                        // hb from the majority. but the paper didnt mention it
+                        for o := range hb_chan </span><span class="cov0" title="0">{
+                                if o.res.Result != int32(AE_OK) </span><span class="cov0" title="0">{
+                                        log.Infof("get hb from:%s not ok[%d:%s]", o.id, o.res.Result, o.res.Msg)
+                                }</span>
+                                <span class="cov0" title="0">if o.res.Term &gt; max_term </span><span class="cov0" title="0">{
+                                        max_term = o.res.Term
+                                }</span>
+                        }
+                        <span class="cov0" title="0">if max_term &gt; current_term </span><span class="cov0" title="0">{
+                                term_chan &lt;- max_term
+                        }</span>
+                }
+        }
+}
+
+func (p *PeerServer) initLeaderIndexes() (int64, int64) <span class="cov0" title="0">{
+        last_entry, err := p.store.GetLastLogEntry()
+        if err != nil </span><span class="cov0" title="0">{
+                log.Fatalf("GetLastLogEntry failed:%v", err)
+        }</span>
+        <span class="cov0" title="0">tmp_n := int64(-1)
+        tmp_m := int64(-1)
+        if last_entry == nil </span><span class="cov0" title="0">{
+                tmp_n = 0
+        }</span> else<span class="cov0" title="0"> {
+                tmp_n = last_entry.Index + 1
+        }</span>
+        <span class="cov0" title="0">return tmp_n, tmp_m</span>
+}
+
+func (p *PeerServer) getLogBatch(next_idx int64, batchsize int) []*pb.LogEntry <span class="cov0" title="0">{
+        iter := p.store.SeekLogAt(next_idx)
+        defer iter.Close()
+        entries := []*pb.LogEntry{}
+        for ; iter.ValidForPrefix(LOG_PREFIX) &amp;&amp; len(entries) &lt; batchsize; iter.Next() </span><span class="cov0" title="0">{
+                entry, err := IterEntry2Log(iter)
+                if err != nil </span><span class="cov0" title="0">{
+                        log.Fatalf("IterEntry2Log failed:%v", err)
+                }</span>
+                <span class="cov0" title="0">entries = append(entries, entry)</span>
+        }
+        <span class="cov0" title="0">return entries</span>
+}
+
+func (p *PeerServer) getPrevLogIdxAndTerm(next_idx int64) (int64, int64) <span class="cov0" title="0">{
+        if next_idx == 0 </span><span class="cov0" title="0">{
+                return -1, -1
+        }</span>
+        <span class="cov0" title="0">entry, err := p.store.GetLogEntry(next_idx - 1)
+        if err != nil </span><span class="cov0" title="0">{
+                log.Fatalf("get entry idx:%d failed:%v", next_idx-1, err)
+        }</span>
+        <span class="cov0" title="0">return entry.Index, entry.Term</span>
+}
+
+// TODO(deyukong): currently, we use a sleep(100ms default) to poll master's new entries
+// however, it may not provide the minimum latency between leader and follower. Here the
+// better choice is to use something like condvars, if client applies new entries, we can
+// get immediate signal.
+// TODO(deyukong): configure follower apply entry timeout/batchsize
+func (p *PeerServer) TransLog(target *PeerInfo, translog_chan chan *AeWrapper, closer *utils.Closer) <span class="cov0" title="0">{
+        defer closer.Done()
+        next_idx, match_idx := p.initLeaderIndexes()
+        // duration default to 100 ms
+        duration := time.Duration(100) * time.Millisecond
+        batchsize := 100
+        // It is guarenteed that master's state and term never changes if this loop is running
+        term_snapshot := p.GetTerm()
+
+        for </span><span class="cov0" title="0">{
+                select </span>{
+                case &lt;-closer.HasBeenClosed():<span class="cov0" title="0">
+                        log.Infof("leader to peer:%s translog stops...", target.host)
+                        return</span>
+                case &lt;-time.After(duration):<span class="cov0" title="0">
+                        last_entry, err := p.store.GetLastLogEntry()
+                        if err != nil </span><span class="cov0" title="0">{
+                                log.Fatalf("GetLastLogEntry failed:%v", err)
+                        }</span>
+                        <span class="cov0" title="0">if last_entry == nil || last_entry.Index &lt; next_idx </span><span class="cov0" title="0">{
+                                // no new entries, we keep waiting, donot reduce wait-duration
+                                break</span>
+                        }
+                        <span class="cov0" title="0">entries := p.getLogBatch(next_idx, batchsize)
+                        if len(entries) == 0 </span><span class="cov0" title="0">{
+                                log.Fatalf("BUG:entries to send shouldnt be empty")
+                        }</span>
+                        <span class="cov0" title="0">prev_idx, prev_term := p.getPrevLogIdxAndTerm(next_idx)
+
+                        req := new(pb.AppendEntriesReq)
+                        req.Header = new(pb.ReqHeader)
+                        req.Term = term_snapshot
+                        req.LeaderId = p.id
+                        if tmp, err := p.store.GetCommitIndex(); err != nil </span><span class="cov0" title="0">{
+                                log.Fatalf("GetCommitIndex failed:%v", err)
+                        }</span> else<span class="cov0" title="0"> {
+                                req.LeaderCommit = tmp
+                        }</span>
+                        <span class="cov0" title="0">req.PrevLogIndex = prev_idx
+                        req.PrevLogTerm = prev_term
+                        ctx, _ := context.WithTimeout(context.Background(), time.Duration(100)*time.Millisecond)
+                        rsp, err := target.client.AppendEntries(ctx, req)
+                        if err != nil </span><span class="cov0" title="0">{
+                                log.Warnf("apply entries:%d to %s failed:%v", len(entries), p.host, err)
+                                break</span>
+                        }
+                        <span class="cov0" title="0">if rsp.Result == int32(AE_OK) </span><span class="cov0" title="0">{
+                                batch_end_idx := entries[len(entries)-1].Index
+                                if batch_end_idx &lt; match_idx </span><span class="cov0" title="0">{
+                                        log.Fatalf("peer:%s batch:%d smaller than match_idx:%d", p.host, batch_end_idx, match_idx)
+                                }</span>
+                                <span class="cov0" title="0">match_idx = batch_end_idx
+                                next_idx = match_idx + 1
+                                if len(entries) == batchsize </span><span class="cov0" title="0">{
+                                        duration = time.Duration(0) * time.Millisecond
+                                }</span> else<span class="cov0" title="0"> {
+                                        duration = time.Duration(100) * time.Millisecond
+                                }</span>
+                        } else<span class="cov0" title="0"> if rsp.Result == int32(AE_TERM_UNMATCH) </span><span class="cov0" title="0">{
+                                if next_idx == 0 </span><span class="cov0" title="0">{
+                                        log.Fatalf("peer:%s unmatch but we have reached the beginning", p.host)
+                                }</span> else<span class="cov0" title="0"> {
+                                        // TODO(deyukong): too slow to find the common point, optimize
+                                        next_idx -= 1
+                                        if next_idx &lt;= match_idx </span><span class="cov0" title="0">{
+                                                log.Fatalf("peer:%s unmatch before match_idx:%d", p.host, match_idx)
+                                        }</span> else<span class="cov0" title="0"> {
+                                                log.Warnf("peer:%s nextidx:%d backoff by one", p.host, next_idx)
+                                        }</span>
+                                }
+                        } else<span class="cov0" title="0"> if rsp.Result == int32(AE_RETRY) </span><span class="cov0" title="0">{
+                                log.Fatalf("peer:%s reply AE_RETRY", p.host)
+                        }</span> else<span class="cov0" title="0"> if rsp.Result == int32(AE_SMALL_TERM) </span>{<span class="cov0" title="0">
+                                // nothing
+                        }</span>
+                        <span class="cov0" title="0">tmp := &amp;AeWrapper{
+                                id:  p.host,
+                                res: rsp,
+                                it: &amp;IndexAndTerm{
+                                        idx:  -1,
+                                        term: -1,
+                                },
+                        }
+                        if rsp.Result == int32(AE_OK) </span><span class="cov0" title="0">{
+                                tmp.it.idx = entries[len(entries)-1].Index
+                                tmp.it.term = entries[len(entries)-1].Term
+                        }</span>
+                        <span class="cov0" title="0">translog_chan &lt;- tmp</span>
+                }
+        }
+}
+
+type CommitForwarder struct {
+        followers map[string]*IndexAndTerm
+}
+
+func (c *CommitForwarder) Init(plist []*PeerInfo) <span class="cov0" title="0">{
+        c.followers = make(map[string]*IndexAndTerm)
+        for _, p := range plist </span><span class="cov0" title="0">{
+                c.followers[p.id] = &amp;IndexAndTerm{
+                        idx:  -1,
+                        term: -1,
+                }
+        }</span>
+}
+
+func (p *PeerServer) ForwardCommitIndex(fwder *CommitForwarder, ae *AeWrapper) <span class="cov0" title="0">{
+        last_entry, err := p.store.GetLastLogEntry()
+        if err != nil </span><span class="cov0" title="0">{
+                log.Fatalf("GetLastLogEntry failed:%v", err)
+        }</span>
+        <span class="cov0" title="0">if last_entry == nil </span><span class="cov0" title="0">{
+                log.Fatalf("leader has no entry, receive peer:%s result:%v", ae.id, ae.res)
+        }</span>
+        <span class="cov0" title="0">it := fwder.followers[ae.id]
+        if it.idx &gt; ae.it.idx </span><span class="cov0" title="0">{
+                log.Fatalf("BUG peer:%s log backtraces!", ae.id)
+        }</span>
+        <span class="cov0" title="0">it.idx = ae.it.idx
+        it.term = ae.it.term
+
+        its := IndexAndTerms{}
+        term_snapshot := p.GetTerm()
+        for _, it := range fwder.followers </span><span class="cov0" title="0">{
+                if it.term == term_snapshot </span><span class="cov0" title="0">{
+                        its = append(its, it)
+                }</span>
+        }
+        // add leader itself's IndexAndTerm to make the logic clear
+        <span class="cov0" title="0">its = append(its, &amp;IndexAndTerm{
+                idx:  last_entry.Index,
+                term: last_entry.Term,
+        })
+        sort.Sort(its)
+        majority_pos := len(p.cluster_info) / 2
+        if majority_pos &gt;= len(its) </span><span class="cov0" title="0">{
+                return
+        }</span>
+        <span class="cov0" title="0">commit_idx := p.GetCommitIndex()
+        if its[majority_pos].idx &lt; commit_idx </span><span class="cov0" title="0">{
+                log.Fatalf("majority idx:%d commit_idx:%d backtrace", its[majority_pos].idx, commit_idx)
+        }</span>
+        <span class="cov0" title="0">p.UpdateCommitIndex(its[majority_pos].idx)</span>
+}
+
+func (p *PeerServer) LeaderCron() <span class="cov0" title="0">{
+        // init local variables
+        hb_term_chan := make(chan int64)
+        closer := utils.NewCloser()
+        translog_chan := make(chan *AeWrapper)
+        new_term := p.current_term
+        var delayed_grantvote func() = nil
+        commit_fwder := &amp;CommitForwarder{}
+        commit_fwder.Init(p.cluster_info)
+
+        closer.AddOne()
+        go p.LeaderHeartBeatCron(hb_term_chan, closer)
+
+        for _, o := range p.cluster_info </span><span class="cov0" title="0">{
+                closer.AddOne()
+                go p.TransLog(o, translog_chan, closer)
+        }</span>
+
+        // TODO(deyukong): we must guarentee that master's term is invariant before the local channels terminates.
+        // otherwise, the two goroutines will use the true-leader's(other than me) term to send hb or logentries
+        // to followers. which in fact is a byzantine-situation. so we donot change current_term until this loop
+        // exits.
+        // cleanup goroutines, be very careful about channel cyclic-dependency, alive-locks
+        <span class="cov0" title="0">defer func() </span><span class="cov0" title="0">{
+                closer.SignalAndAsyncWait()
+                for </span><span class="cov0" title="0">{
+                        // no need to handle new_entry_pair and vote_pair, they are global and
+                        // every loop will handle these two pairs, but hb_term_chan and {???} are
+                        // local channels, we must strictly control their scopes, limit them in
+                        // leader-loop
+                        select </span>{
+                        case tmp := &lt;-hb_term_chan:<span class="cov0" title="0">
+                                log.Infof("ignore msg:%d from hb_term_chan since master stepping down", tmp)</span>
+                        case &lt;-closer.CloseCompleted():<span class="cov0" title="0">
+                                log.Infof("hb channel and translog channels are all closed, leader stepdown finish")
+                                if new_term &gt; p.current_term </span><span class="cov0" title="0">{
+                                        p.ChangeState(pb.PeerState_Follower)
+                                        p.UpdateTerm(new_term)
+                                }</span>
+                                <span class="cov0" title="0">if delayed_grantvote != nil </span><span class="cov0" title="0">{
+                                        delayed_grantvote()
+                                }</span>
+                                <span class="cov0" title="0">return</span>
+                        }
+                }
+        }()
+
+        <span class="cov0" title="0">for </span><span class="cov0" title="0">{
+                select </span>{
+                case &lt;-p.closer.HasBeenClosed():<span class="cov0" title="0">
+                        log.Infof("leader cron stops...")
+                        return</span>
+                case tmp := &lt;-hb_term_chan:<span class="cov0" title="0">
+                        if tmp &gt; p.current_term </span><span class="cov0" title="0">{
+                                log.Infof("leader term:%d got hb monotonic term:%d, turn follower", p.current_term, tmp)
+                                new_term = tmp
+                                return
+                        }</span> else<span class="cov0" title="0"> {
+                                log.Debugf("leader term:%d got hb:%d smaller", p.current_term, tmp)
+                        }</span>
+                case tmp := &lt;-translog_chan:<span class="cov0" title="0">
+                        if tmp.res.Term &gt; p.current_term </span><span class="cov0" title="0">{
+                                log.Infof("leader term:%d got[%s] translog monotonic term:%d, turn follower",
+                                        p.current_term, tmp.id, tmp.res.Term)
+                                if tmp.res.Result == int32(AE_OK) </span><span class="cov0" title="0">{
+                                        log.Fatalf("leader term:%d got[%s] invalid translog result:%v",
+                                                p.current_term, tmp.id, tmp.res)
+                                }</span>
+                                <span class="cov0" title="0">new_term = tmp.res.Term
+                                return</span>
+                        } else<span class="cov0" title="0"> {
+                                log.Debugf("leader term:%d got[%s] hb:%d smaller", p.current_term, tmp.id, tmp.res.Term)
+                                p.ForwardCommitIndex(commit_fwder, tmp)
+                        }</span>
+                case tmp := &lt;-p.new_entry_pair.input:<span class="cov0" title="0">
+                        if p.current_term &gt; tmp.Term </span><span class="cov0" title="0">{
+                                log.Infof("leader term:%d got entry with smaller term:%d", p.current_term, tmp.Term)
+                                p.new_entry_pair.output &lt;- &amp;pb.AppendEntriesRes{
+                                        Header: new(pb.ResHeader),
+                                        Result: int32(AE_SMALL_TERM),
+                                        Msg:    fmt.Sprintf("req term:%d smaller than candidate:%d", tmp.Term, p.current_term),
+                                        Term:   p.current_term,
+                                }
+                        }</span> else<span class="cov0" title="0"> if p.current_term == tmp.Term </span><span class="cov0" title="0">{
+                                log.Fatalf("BUG:leader term:%d meet appendentry:%v same term", p.current_term, tmp)
+                        }</span> else<span class="cov0" title="0"> {
+                                log.Infof("leader term:%d got entry monotonic term:%d, turn follower", p.current_term, tmp.Term)
+                                new_term = tmp.Term
+                                p.new_entry_pair.output &lt;- &amp;pb.AppendEntriesRes{
+                                        Header: new(pb.ResHeader),
+                                        Result: int32(AE_RETRY),
+                                        Msg:    "",
+                                        Term:   new_term,
+                                }
+                                return
+                        }</span>
+                case tmp := &lt;-p.vote_pair.input:<span class="cov0" title="0">
+                        if tmp.Term &gt; new_term </span><span class="cov0" title="0">{
+                                new_term = tmp.Term
+                                // The grantVote process must be deferred to when local goroutines are all finished.
+                                delayed_grantvote = func() </span><span class="cov0" title="0">{
+                                        ok, reason := p.GrantVote(tmp)
+                                        result := &amp;pb.RequestVoteRes{
+                                                Header:      new(pb.ResHeader),
+                                                VoteGranted: p.vote_for,
+                                                Term:        p.current_term,
+                                        }
+                                        if !ok </span><span class="cov0" title="0">{
+                                                log.Infof("leader term:%d got vote[%s:%d], not grant:%s",
+                                                        p.current_term, tmp.CandidateId, tmp.Term, reason)
+                                        }</span> else<span class="cov0" title="0"> {
+                                                log.Infof("leader term:%d got vote[%s:%d] and granted",
+                                                        p.current_term, tmp.CandidateId, tmp.Term)
+                                        }</span>
+                                        <span class="cov0" title="0">p.vote_pair.output &lt;- result</span>
+                                }
+                                <span class="cov0" title="0">return</span>
+                        } else<span class="cov0" title="0"> {
+                                log.Infof("leader term:%d got smaller vote:%d from:%d, ignore",
+                                        p.current_term, tmp.Term, tmp.CandidateId)
+                                p.vote_pair.output &lt;- &amp;pb.RequestVoteRes{
+                                        Header:      new(pb.ResHeader),
+                                        VoteGranted: p.vote_for,
+                                        Term:        p.current_term,
+                                }
+                        }</span>
+                }
+        }
+}
+</pre>
+		
+		<pre class="file" id="file3" style="display: none">package peer
+
+import (
+        pb "anraft/proto/peer_proto"
+        "anraft/storage"
+        "anraft/utils"
+        "fmt"
+        context "golang.org/x/net/context"
+        "google.golang.org/grpc"
+        "github.com/ngaut/log"
+        "sync"
+        "time"
+)
+
+/************************************************************************************
+                        +---------------------------------------------------------+
+                        |                            RoleMaintain Loop            |
+                        |                                                         |
+                        |                          +--------------------------+   |
+                        |                          |   Leader  Loop           |   |
+                        |                    +-----|                          |   |
+                        |                    |     +--------------------------+   |
+     +-----------+      |      +----------+  |     +--------------------------+   |
+     | Rpc       |-------------| Pipe Pair|--|-----|   Follower Loop          |   |
+     +-----------+      |      +----------+  |     |                          |   |
+                        |                    |     +--------------------------+   |
+                        |                    |     +--------------------------+   |
+                        |                    +-----|   Candidate Loop         |   |
+                        |                          |                          |   |
+                        |                          +--------------------------+   |
+                        |                                                         |
+                        +---------------------------------------------------------+
+
+NOTE(deyukong): the thread model is above, meta changing is processed only in
+RoleMaintain loop(thread), a rpc(like appendentry) from other threads may require
+synchronous process. It passes params through new_entry_pair.input and wait on
+new_entry_pair.output. Three sub-loops in RoleMaintain loop transfers between each
+other with roles. but they are in one thread, so new_entry_pair is handled without
+race problems.
+***********************************************************************************/
+
+// appendEntry result
+type AeResult int
+
+const (
+        AE_OK AeResult = iota
+        AE_RETRY
+        AE_SMALL_TERM
+        AE_TERM_UNMATCH
+)
+
+const (
+        LAG_MAX = 1000
+)
+
+type PeerInfo struct {
+        host   string
+        id     string
+        client pb.PeerClient
+}
+
+type NewEntryPair struct {
+        input  chan *pb.AppendEntriesReq
+        output chan *pb.AppendEntriesRes
+}
+
+type VotePair struct {
+        input  chan *pb.RequestVoteReq
+        output chan *pb.RequestVoteRes
+}
+
+type AeWrapper struct {
+        id  string
+        res *pb.AppendEntriesRes
+        it  *IndexAndTerm
+}
+
+type IndexAndTerm struct {
+        idx  int64
+        term int64
+}
+
+type IndexAndTerms []*IndexAndTerm
+
+func (its IndexAndTerms) Len() int <span class="cov0" title="0">{
+        return len(its)
+}</span>
+
+func (its IndexAndTerms) Less(i, j int) bool <span class="cov0" title="0">{
+        return its[i].idx &lt; its[j].idx
+}</span>
+
+func (its IndexAndTerms) Swap(i, j int) <span class="cov0" title="0">{
+        its[i], its[j] = its[j], its[i]
+}</span>
+
+func (p *PeerInfo) Init(id string, host string) error <span class="cov8" title="1">{
+        // NOTE(deyukong): things may be difficult if servers cheat about their ids.
+        // but raft is non-byzantine, it's ops' duty to ensure this.
+        p.host = host
+        p.id = id
+        conn, err := grpc.Dial(p.host,
+                grpc.WithInsecure(),
+                // NOTE(deyukong): no need to block, grpc-client auto reconnects
+                // grpc.WithBlock(),
+                // grpc.WithTimeout(timeout))
+        )
+        if err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+        <span class="cov8" title="1">p.client = pb.NewPeerClient(conn)
+        return nil</span>
+}
+
+type PeerServer struct {
+        host         string
+        id           string
+        cluster_info []*PeerInfo
+        mutex        sync.Mutex
+        // in-mem cache of the in-disk persistent term, protected by mutex
+        current_term int64
+        // in-mem cache of the in-disk persistent vote_for, protected by mutex
+        vote_for string
+        // in-mem cache of the persist commit-index
+        commit_index   int64
+        state          pb.PeerState
+        store          *PeerStorage
+        new_entry_pair *NewEntryPair
+        vote_pair      *VotePair
+    closer         *utils.Closer
+        /* the name of election_timeout is from 5.2 */
+        /* if a follower receives on communication over a period of time */
+        /* called the election timeout, then ...... */
+        election_timeout  time.Duration
+        election_interval time.Duration
+}
+
+func (p *PeerServer) Init(my_id, my_host string, hosts map[string]string,
+        store_engine storage.Storage, etime time.Duration) error <span class="cov8" title="1">{
+        if _, ok := hosts[my_id]; !ok </span><span class="cov0" title="0">{
+                return fmt.Errorf("self should be in cluster")
+        }</span>
+        <span class="cov8" title="1">p.host = my_host
+        p.id = my_id
+        p.cluster_info = []*PeerInfo{}
+        for id, host := range hosts </span><span class="cov8" title="1">{
+                peerInfo := PeerInfo{}
+                peerInfo.Init(id, host)
+                p.cluster_info = append(p.cluster_info, &amp;peerInfo)
+        }</span>
+        <span class="cov8" title="1">p.election_timeout = etime
+        p.election_interval = etime / 3
+        /* see 5.2 leader election */
+        /* when servers start up, they begin as followers */
+        p.state = pb.PeerState_Follower
+        p.new_entry_pair = &amp;NewEntryPair{
+                input:  make(chan *pb.AppendEntriesReq),
+                output: make(chan *pb.AppendEntriesRes),
+        }
+        p.vote_pair = &amp;VotePair{
+                input:  make(chan *pb.RequestVoteReq),
+                output: make(chan *pb.RequestVoteRes),
+        }
+    p.closer = utils.NewCloser()
+        p.store = &amp;PeerStorage{}
+        p.store.Init(store_engine)
+
+        var err error = nil
+        if p.current_term, err = p.store.GetTerm(); err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+        <span class="cov8" title="1">if p.vote_for, err = p.store.GetVoteFor(); err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+        <span class="cov8" title="1">if p.commit_index, err = p.store.GetCommitIndex(); err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+    <span class="cov8" title="1">p.closer.AddOne()
+        go p.RoleManageThd()
+        return nil</span>
+}
+
+func (p *PeerServer) HeartBeat(context.Context, *pb.HeartBeatReq) (*pb.HeartBeatRes, error) <span class="cov0" title="0">{
+        return nil, nil
+}</span>
+
+// NOTE(deyukong): to make the thread model simple, we only allow RoleManageThd thread to change
+// peer's state, other threads communicate with this thread
+func (p *PeerServer) RoleManageThd() <span class="cov8" title="1">{
+    defer p.closer.Done()
+        for </span><span class="cov8" title="1">{
+        select </span>{
+        case &lt;-p.closer.HasBeenClosed():<span class="cov8" title="1">
+            log.Infof("process shutting down...")
+            return</span>
+        default:</span><span class="cov8" title="1"> // nothing
+        }
+                <span class="cov8" title="1">if p.state == pb.PeerState_Follower </span><span class="cov8" title="1">{
+                        p.FollowerCron()
+                }</span> else<span class="cov0" title="0"> if p.state == pb.PeerState_Leader </span><span class="cov0" title="0">{
+                        p.LeaderCron()
+                }</span> else<span class="cov0" title="0"> if p.state == pb.PeerState_Candidate </span><span class="cov0" title="0">{
+                        log.Fatalf("candidate state, code should not reach here")
+                }</span> else<span class="cov0" title="0"> {
+                        log.Fatalf("invalid state:%d", int(p.state))
+                }</span>
+        }
+}
+
+// requires mutex held
+func (p *PeerServer) updateTermInLock(new_term int64) error <span class="cov8" title="1">{
+        if p.current_term &gt;= new_term </span><span class="cov0" title="0">{
+                log.Fatalf("updateTermInLock with new:%d not greater than mine:%d", new_term, p.current_term)
+        }</span>
+        <span class="cov8" title="1">p.current_term = new_term
+        if err := p.store.SaveTerm(p.current_term); err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+        <span class="cov8" title="1">p.vote_for = ""
+        if err := p.store.SaveVoteFor(p.vote_for); err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+        <span class="cov8" title="1">return nil</span>
+}
+
+// requires mutex held
+func (p *PeerServer) voteInLock(id string) error <span class="cov8" title="1">{
+        if p.vote_for != "" </span><span class="cov0" title="0">{
+                log.Fatalf("vote_for should be empty")
+        }</span>
+        <span class="cov8" title="1">p.vote_for = id
+        if err := p.store.SaveVoteFor(p.vote_for); err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+        <span class="cov8" title="1">return nil</span>
+}
+
+func (p *PeerServer) RequestVote(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) <span class="cov0" title="0">{
+        now_term, vote_for := p.GetTermAndVoteFor()
+        rsp := new(pb.RequestVoteRes)
+        rsp.Header = new(pb.ResHeader)
+        if req.Term &lt; now_term </span><span class="cov0" title="0">{
+                rsp.Term = now_term
+                rsp.VoteGranted = vote_for
+                return rsp, nil
+        }</span>
+        <span class="cov0" title="0">p.vote_pair.input &lt;- req
+        return &lt;-p.vote_pair.output, nil</span>
+}
+
+// TODO(deyukong): unittests about term, logterm, it's quite complex
+func (p *PeerServer) IsLogUpToDate(req *pb.RequestVoteReq) bool <span class="cov0" title="0">{
+        last_entry, err := p.store.GetLastLogEntry()
+        if err != nil </span><span class="cov0" title="0">{
+                log.Fatalf("get last entry failed:%v", err)
+        }</span>
+        // mine is nil, whatever is uptodate with me.
+        <span class="cov0" title="0">if last_entry == nil </span><span class="cov0" title="0">{
+                return true
+        }</span>
+        // chapter5.4.2 defines strictly what is "up-to-date"
+        // if the logs have last entries with different terms, then the log with the later term is more up-to-date.
+        // if the logs end with the same term, then whichever log is longer(NOTE:deyukong, "longer" here I think
+        // is synonymous with "greater index') is more up-to-update
+        <span class="cov0" title="0">return req.LastLogTerm &gt; last_entry.Term ||
+                (req.LastLogTerm == last_entry.Term &amp;&amp; req.LastLogIndex &gt;= last_entry.Index)</span>
+}
+
+func (p *PeerServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq) (*pb.AppendEntriesRes, error) <span class="cov0" title="0">{
+        now_term := p.GetTerm()
+        rsp := new(pb.AppendEntriesRes)
+        rsp.Header = new(pb.ResHeader)
+        if req.Term &lt; now_term </span><span class="cov0" title="0">{
+                rsp.Term = now_term
+                rsp.Result = int32(AE_OK)
+                return rsp, nil
+        }</span>
+        <span class="cov0" title="0">p.new_entry_pair.input &lt;- req
+        pipe_output := &lt;-p.new_entry_pair.output
+        if pipe_output.Result == int32(AE_RETRY) </span><span class="cov0" title="0">{
+                log.Infof("appendEntry with term:%d retries", req.Term)
+                return p.AppendEntries(ctx, req)
+        }</span>
+        <span class="cov0" title="0">return pipe_output, nil</span>
+}
+
+func (p *PeerServer) GetCommitIndex() int64 <span class="cov0" title="0">{
+        p.mutex.Lock()
+        defer p.mutex.Unlock()
+        return p.commit_index
+}</span>
+
+func (p *PeerServer) UpdateCommitIndex(idx int64) <span class="cov0" title="0">{
+        p.mutex.Lock()
+        defer p.mutex.Unlock()
+
+        // it's upper logic's duty to guarentee this
+        if p.commit_index &gt; idx </span><span class="cov0" title="0">{
+                log.Fatalf("UpdateCommitIndex with smaller index:%d, mine:%d", idx, p.commit_index)
+        }</span>
+        <span class="cov0" title="0">if p.commit_index == idx </span><span class="cov0" title="0">{
+                return
+        }</span>
+
+        <span class="cov0" title="0">if err := p.store.SaveCommitIndex(idx); err != nil </span><span class="cov0" title="0">{
+                log.Fatalf("SaveCommitIndex:%d failed:%v", idx, err)
+        }</span>
+        <span class="cov0" title="0">p.commit_index = idx</span>
+}
+
+// NOTE(deyukong): can only be called from main thread
+func (p *PeerServer) GrantVote(req *pb.RequestVoteReq) (bool, string) <span class="cov0" title="0">{
+        if p.current_term &gt; req.Term </span><span class="cov0" title="0">{
+                return false, fmt.Sprintf("smaller term, mine:%d, his:%d", p.current_term, req.Term)
+        }</span>
+        <span class="cov0" title="0">if p.current_term == req.Term &amp;&amp; p.vote_for != "" &amp;&amp; p.vote_for != req.CandidateId </span><span class="cov0" title="0">{
+                return false, fmt.Sprintf("same term:%d voted for others:%s", p.current_term, p.vote_for)
+        }</span>
+
+        // here, current_term &lt;= req.Term, no matter vote granted or not, we must update our term
+        <span class="cov0" title="0">p.mutex.Lock()
+        defer p.mutex.Unlock()
+        if p.current_term &lt; req.Term </span><span class="cov0" title="0">{
+                if err := p.updateTermInLock(req.Term); err != nil </span><span class="cov0" title="0">{
+                        log.Fatalf("updateTermInLock failed:%v", err)
+                }</span>
+        }
+        <span class="cov0" title="0">if !p.IsLogUpToDate(req) </span><span class="cov0" title="0">{
+                return false, fmt.Sprintf("log not as uptodate")
+        }</span>
+        <span class="cov0" title="0">if err := p.voteInLock(req.CandidateId); err != nil </span><span class="cov0" title="0">{
+                log.Fatalf("voteInLock failed:%v", err)
+        }</span>
+        <span class="cov0" title="0">return true, ""</span>
+}
+
+func (p *PeerServer) UpdateTerm(term int64) bool <span class="cov0" title="0">{
+        p.mutex.Lock()
+        defer p.mutex.Unlock()
+        if p.current_term &gt; term </span><span class="cov0" title="0">{
+                log.Fatalf("it's upper logic to guarentee current_term &gt; term before update")
+        }</span>
+        <span class="cov0" title="0">if p.current_term == term </span><span class="cov0" title="0">{
+                return false
+        }</span>
+        <span class="cov0" title="0">if err := p.updateTermInLock(term); err != nil </span><span class="cov0" title="0">{
+                log.Fatalf("updateTermInLock failed:%v", err)
+        }</span>
+        <span class="cov0" title="0">return true</span>
+}
+
+// used for user-interactive thread, protected by mutex
+func (p *PeerServer) GetTerm() int64 <span class="cov0" title="0">{
+        p.mutex.Lock()
+        defer p.mutex.Unlock()
+        return p.current_term
+}</span>
+
+func (p *PeerServer) GetTermAndVoteFor() (int64, string) <span class="cov0" title="0">{
+        p.mutex.Lock()
+        defer p.mutex.Unlock()
+        return p.current_term, p.vote_for
+}</span>
+
+func (p *PeerServer) changeStateInLock(s pb.PeerState) <span class="cov8" title="1">{
+        p.state = s
+}</span>
+
+func (p *PeerServer) getStateInLock() pb.PeerState <span class="cov0" title="0">{
+        return p.state
+}</span>
+
+func (p *PeerServer) GetState() pb.PeerState <span class="cov0" title="0">{
+        p.mutex.Lock()
+        defer p.mutex.Unlock()
+        return p.getStateInLock()
+}</span>
+
+func (p *PeerServer) ChangeState(s pb.PeerState) <span class="cov8" title="1">{
+        p.mutex.Lock()
+        defer p.mutex.Unlock()
+        p.changeStateInLock(s)
+}</span>
+
+func (p *PeerServer) Stop() <span class="cov8" title="1">{
+    log.Infof("server stops")
+    p.closer.SignalAndWait()
+    log.Infof("server stops done")
+}</span>
+</pre>
+		
+		<pre class="file" id="file4" style="display: none">package peer
+
+import (
+        pb "anraft/proto/peer_proto"
+        "anraft/storage"
+        "fmt"
+        "github.com/golang/protobuf/proto"
+        "github.com/ngaut/log"
+        "math"
+        "strconv"
+)
+
+type SectionPrefix int8
+
+const (
+        META SectionPrefix = iota
+        LOG
+        KV
+)
+
+const (
+        CURRENT_TERM = "CURRENT_TERM"
+        VOTE_FOR     = "VOTE_FOR"
+        COMMIT_IDX   = "COMMIT_IDX"
+)
+
+var (
+        LOG_PREFIX = []byte(fmt.Sprintf("%03d|", LOG))
+        LOG_END    = []byte(fmt.Sprintf("%03d|%021d", LOG, math.MaxInt64))
+)
+
+// TODO(deyukong): classify all the store apis, which needs durable, which does not
+type PeerStorage struct {
+        engine storage.Storage
+}
+
+func (p *PeerStorage) Init(engine storage.Storage) <span class="cov8" title="1">{
+        p.engine = engine
+
+        // CURRENT_TERM init to 0
+        // VOTE_FOR init to ""
+        // COMMIT_IDX init to -1
+        init_map := map[string][]byte{
+                fmt.Sprintf("%03d|%s", META, CURRENT_TERM): []byte(fmt.Sprintf("%d", 0)),
+                fmt.Sprintf("%03d|%s", META, VOTE_FOR):     []byte(""),
+                fmt.Sprintf("%03d|%s", META, COMMIT_IDX):   []byte(fmt.Sprintf("%d", -1)),
+        }
+        for k, v := range init_map </span><span class="cov8" title="1">{
+                if _, err := p.engine.Get([]byte(k)); err != nil </span><span class="cov8" title="1">{
+                        if err == storage.ErrKeyNotFound </span><span class="cov8" title="1">{
+                                if err := p.engine.Set([]byte(k), v); err != nil </span><span class="cov0" title="0">{
+                                        log.Fatalf("init key:%s failed:%v", k, err)
+                                }</span>
+                                <span class="cov8" title="1">log.Infof("init key:%s to %s succ", k, string(v))</span>
+                        } else<span class="cov0" title="0"> {
+                                log.Fatalf("get key:%s init value failed:%v", k, err)
+                        }</span>
+                }
+        }
+}
+
+// NOTE(deyukong): It's confusion to handle endians, so I convert nums to strings with preceding zeros
+func (p *PeerStorage) SaveTerm(term int64) error <span class="cov8" title="1">{
+        key := fmt.Sprintf("%03d|%s", META, CURRENT_TERM)
+        val := fmt.Sprintf("%d", term)
+        return p.engine.Set([]byte(key), []byte(val))
+}</span>
+
+func (p *PeerStorage) GetTerm() (int64, error) <span class="cov8" title="1">{
+        key := fmt.Sprintf("%03d|%s", META, CURRENT_TERM)
+        if bytes, err := p.engine.Get([]byte(key)); err != nil </span><span class="cov0" title="0">{
+                return 0, err
+        }</span> else<span class="cov8" title="1"> if term, err := strconv.ParseInt(string(bytes), 10, 64); err != nil </span><span class="cov0" title="0">{
+                return 0, err
+        }</span> else<span class="cov8" title="1"> {
+                return term, nil
+        }</span>
+}
+
+func (p *PeerStorage) SaveVoteFor(vote_for string) error <span class="cov8" title="1">{
+        key := fmt.Sprintf("%03d|%s", META, VOTE_FOR)
+        return p.engine.Set([]byte(key), []byte(vote_for))
+}</span>
+
+func (p *PeerStorage) GetVoteFor() (string, error) <span class="cov8" title="1">{
+        key := fmt.Sprintf("%03d|%s", META, VOTE_FOR)
+        if bytes, err := p.engine.Get([]byte(key)); err != nil </span><span class="cov0" title="0">{
+                return "", err
+        }</span> else<span class="cov8" title="1"> {
+                return string(bytes), nil
+        }</span>
+}
+
+func (p *PeerStorage) SaveCommitIndex(idx int64) error <span class="cov8" title="1">{
+        key := fmt.Sprintf("%03d|%s", META, COMMIT_IDX)
+        val := fmt.Sprintf("%d", idx)
+        return p.engine.Set([]byte(key), []byte(val))
+}</span>
+
+func (p *PeerStorage) GetCommitIndex() (int64, error) <span class="cov8" title="1">{
+        key := fmt.Sprintf("%03d|%s", META, COMMIT_IDX)
+        if bytes, err := p.engine.Get([]byte(key)); err != nil </span><span class="cov0" title="0">{
+                return 0, err
+        }</span> else<span class="cov8" title="1"> if term, err := strconv.ParseInt(string(bytes), 10, 64); err != nil </span><span class="cov0" title="0">{
+                return 0, err
+        }</span> else<span class="cov8" title="1"> {
+                return term, nil
+        }</span>
+}
+
+func (p *PeerStorage) GetLogEntry(index int64) (*pb.LogEntry, error) <span class="cov8" title="1">{
+        key := fmt.Sprintf("%03d|%021d", LOG, index)
+        if bytes, err := p.engine.Get([]byte(key)); err != nil </span><span class="cov8" title="1">{
+                return nil, err
+        }</span> else<span class="cov8" title="1"> {
+                result := &amp;pb.LogEntry{}
+                if err := proto.Unmarshal(bytes, result); err != nil </span><span class="cov0" title="0">{
+                        return nil, err
+                }</span>
+                <span class="cov8" title="1">return result, nil</span>
+        }
+}
+
+func (p *PeerStorage) SeekLogAt(index int64) storage.Iterator <span class="cov8" title="1">{
+        key := fmt.Sprintf("%03d|%021d", LOG, index)
+        return p.engine.Seek([]byte(key), true)
+}</span>
+
+func (p *PeerStorage) DelLogEntry(e *pb.LogEntry) error <span class="cov8" title="1">{
+        key := fmt.Sprintf("%03d|%021d", LOG, e.Index)
+        return p.engine.Del([]byte(key))
+}</span>
+
+func (p *PeerStorage) AppendLogEntry(e *pb.LogEntry) error <span class="cov8" title="1">{
+        key := fmt.Sprintf("%03d|%021d", LOG, e.Index)
+        if val, err := proto.Marshal(e); err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span> else<span class="cov8" title="1"> {
+                return p.engine.Set([]byte(key), val)
+        }</span>
+}
+
+func (p *PeerStorage) GetLastLogEntry() (*pb.LogEntry, error) <span class="cov8" title="1">{
+        iter := p.engine.Seek(LOG_END, false)
+        // empty log
+        if !iter.ValidForPrefix(LOG_PREFIX) </span><span class="cov8" title="1">{
+                return nil, nil
+        }</span>
+        <span class="cov8" title="1">return IterEntry2Log(iter)</span>
+}
+
+func IterEntry2Log(iter storage.Iterator) (*pb.LogEntry, error) <span class="cov8" title="1">{
+        if entry, err := iter.Entry(); err != nil </span><span class="cov0" title="0">{
+                return nil, err
+        }</span> else<span class="cov8" title="1"> {
+                result := &amp;pb.LogEntry{}
+                if err := proto.Unmarshal(entry.Val, result); err != nil </span><span class="cov0" title="0">{
+                        return nil, err
+                }</span>
+                <span class="cov8" title="1">return result, nil</span>
+        }
+}
+</pre>
+		
+		</div>
+	</body>
+	<script>
+	(function() {
+		var files = document.getElementById('files');
+		var visible;
+		files.addEventListener('change', onChange, false);
+		function select(part) {
+			if (visible)
+				visible.style.display = 'none';
+			visible = document.getElementById(part);
+			if (!visible)
+				return;
+			files.value = part;
+			visible.style.display = 'block';
+			location.hash = part;
+		}
+		function onChange() {
+			select(files.value);
+			window.scrollTo(0, 0);
+		}
+		if (location.hash != "") {
+			select(location.hash.substr(1));
+		}
+		if (!visible) {
+			select("file0");
+		}
+	})();
+	</script>
+</html>

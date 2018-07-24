@@ -12,7 +12,8 @@ type Closer struct {
 
 func NewCloser() *Closer {
 	return &Closer{
-		closed: make(chan int),
+		closed:       make(chan int),
+		exit_wg_chan: make(chan int),
 	}
 }
 
