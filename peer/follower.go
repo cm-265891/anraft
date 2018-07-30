@@ -65,6 +65,13 @@ func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEn
 		}
 	}
 
+	for _, master_entry := range entries.Entries {
+		if master_entry.Term > entries.Term {
+			log.Fatalf("BUG:receive entries term:%d, subterm:%d from %s",
+				entries.Term, master_entry.Term, entries.LeaderId)
+		}
+	}
+
 	p.UpdateTerm(entries.Term)
 	if len(entries.Entries) == 0 {
 		// heartbeat
@@ -95,6 +102,9 @@ func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEn
 		entry, err := IterEntry2Log(iter)
 		if err != nil {
 			log.Fatalf("idx:%d parse rawlog to logentry failed:%v", entries.PrevLogIndex, err)
+		}
+		if entry.Index != entries.PrevLogIndex {
+			log.Fatalf("seek index:%d, my upper_bound:%d not match", entries.PrevLogIndex, entry.Index)
 		}
 		// entry not match
 		if entry.Term != entries.PrevLogTerm {

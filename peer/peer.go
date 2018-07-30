@@ -175,9 +175,14 @@ func (p *PeerServer) Init(my_id, my_host string, hosts map[string]string,
 	if p.commit_index, err = p.store.GetCommitIndex(); err != nil {
 		return err
 	}
+	log.Infof("peer:%s start with current_term:%d, vote_for:%s, commit_index:%d",
+		my_id, p.current_term, p.vote_for, p.commit_index)
+	return nil
+}
+
+func (p *PeerServer) Start() {
 	p.closer.AddOne()
 	go p.RoleManageThd()
-	return nil
 }
 
 func (p *PeerServer) HeartBeat(context.Context, *pb.HeartBeatReq) (*pb.HeartBeatRes, error) {
@@ -382,6 +387,7 @@ func (p *PeerServer) ChangeState(s pb.PeerState) {
 	p.changeStateInLock(s)
 }
 
+// we must guarentee all threads exits before this function returns
 func (p *PeerServer) Stop() {
 	log.Infof("server stops")
 	p.closer.SignalAndWait()

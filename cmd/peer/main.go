@@ -136,8 +136,8 @@ func Main() error {
 		return err
 	}
 	peer_proto.RegisterPeerServer(grpc_svr, peer_svr)
+    peer_svr.Start()
 	go grpc_svr.Serve(listener)
-
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc,
 		syscall.SIGINT,
@@ -148,5 +148,6 @@ func Main() error {
 	log.Infof("Server Got signal [%d] to exit.", sig)
 	signal.Stop(sc)
 	grpc_svr.Stop()
+    peer_svr.Stop()
 	return nil
 }
