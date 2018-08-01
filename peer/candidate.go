@@ -148,6 +148,8 @@ WAIT_ELECT_FOR_END:
 			}
 		}
 	}
+	log.Infof("same_term_map:%+v", same_term_map)
+
 	if majority_id == "" {
 		// [0, 2) * p.election_timeout
 		nanocount := int64(p.election_timeout / time.Nanosecond)

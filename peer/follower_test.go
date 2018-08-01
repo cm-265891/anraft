@@ -50,6 +50,38 @@ func TestFollowerTimeout(t *testing.T) {
 	}
 }
 
+func TestFollowerGrantVote(t *testing.T) {
+	ctx := startup_follower_test(t)
+	defer teardown_follower_test(t, ctx)
+	go ctx.svr.FollowerCron()
+
+	req := &pb.RequestVoteReq{}
+	req.Term = 1
+	req.CandidateId = "id1"
+	req.LastLogIndex = 1
+	req.LastLogTerm = 1
+
+	// vote with normal info
+	ctx.svr.vote_pair.input <- req
+	output := <-ctx.svr.vote_pair.output
+	if output.VoteGranted != "id1" || output.Term != 1 {
+		t.Errorf("invalid vote output:%v", output)
+		return
+	}
+
+	// vote with diffrent id
+	req.CandidateId = "id2"
+	ctx.svr.vote_pair.input <- req
+	output = <-ctx.svr.vote_pair.output
+	if output.VoteGranted != "id1" || output.Term != 1 {
+		t.Errorf("invalid vote output:%v", output)
+		return
+	}
+
+	// we have tested grantVote in peer_test.go
+	// here we just cover follower's related code.
+}
+
 func TestFollowerAppendEntry(t *testing.T) {
 	ctx := startup_follower_test(t)
 	defer teardown_follower_test(t, ctx)
