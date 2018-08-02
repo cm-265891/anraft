@@ -8,6 +8,7 @@ import (
 	"github.com/ngaut/log"
 	context "golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"strings"
 	"sync"
 	"time"
 )
@@ -80,7 +81,19 @@ type IndexAndTerm struct {
 	term int64
 }
 
+func (it IndexAndTerm) String() string {
+	return fmt.Sprintf("{idx:%d,term:%d}", it.idx, it.term)
+}
+
 type IndexAndTerms []*IndexAndTerm
+
+func (its IndexAndTerms) String() string {
+	s := []string{}
+	for _, o := range its {
+		s = append(s, fmt.Sprintf("%v", o))
+	}
+	return strings.Join(s, ",")
+}
 
 func (its IndexAndTerms) Len() int {
 	return len(its)

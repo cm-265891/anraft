@@ -213,14 +213,21 @@ type CommitForwarder struct {
 	followers map[string]*IndexAndTerm
 }
 
-func (c *CommitForwarder) Init(plist []*PeerInfo) {
+func (c *CommitForwarder) Init(plist []*PeerInfo, my_id string) {
 	c.followers = make(map[string]*IndexAndTerm)
 	for _, p := range plist {
+		if my_id == p.id {
+			continue
+		}
 		c.followers[p.id] = &IndexAndTerm{
 			idx:  -1,
 			term: -1,
 		}
 	}
+}
+
+func (c *CommitForwarder) String() string {
+	return fmt.Sprintf("%v", c.followers)
 }
 
 func (p *PeerServer) ForwardCommitIndex(fwder *CommitForwarder, ae *AeWrapper) {
@@ -241,9 +248,7 @@ func (p *PeerServer) ForwardCommitIndex(fwder *CommitForwarder, ae *AeWrapper) {
 	its := IndexAndTerms{}
 	term_snapshot := p.GetTerm()
 	for _, it := range fwder.followers {
-		if it.term == term_snapshot {
-			its = append(its, it)
-		}
+		its = append(its, it)
 	}
 	// add leader itself's IndexAndTerm to make the logic clear
 	its = append(its, &IndexAndTerm{
@@ -259,6 +264,14 @@ func (p *PeerServer) ForwardCommitIndex(fwder *CommitForwarder, ae *AeWrapper) {
 	if its[majority_pos].idx < commit_idx {
 		log.Fatalf("majority idx:%d commit_idx:%d backtrace", its[majority_pos].idx, commit_idx)
 	}
+	if its[majority_pos].term > term_snapshot {
+		log.Fatalf("invalid commit-fwder:%v", fwder)
+	}
+	if its[majority_pos].term < term_snapshot {
+		log.Warnf("commit-fwder[%v] majority pos term smaller than mine:%d", fwder, term_snapshot)
+		return
+	}
+	// majority_pos.term == term_snapshot
 	p.UpdateCommitIndex(its[majority_pos].idx)
 }
 
@@ -270,7 +283,7 @@ func (p *PeerServer) LeaderCron() {
 	new_term := p.current_term
 	var delayed_grantvote func() = nil
 	commit_fwder := &CommitForwarder{}
-	commit_fwder.Init(p.cluster_info)
+	commit_fwder.Init(p.cluster_info, p.id)
 
 	closer.AddOne()
 	go p.LeaderHeartBeatCron(hb_term_chan, closer)
