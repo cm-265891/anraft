@@ -120,10 +120,87 @@ func TestCandidateVoteDraw(t *testing.T) {
 			}
 		}(o.id))
 	}
-	// make it donot retry
 	go ctx.svr.Elect()
 	time.Sleep(3 * time.Second)
 	if ctx.svr.state != pb.PeerState_Candidate {
 		t.Errorf("peer should keep candidate after elect draw:%v", ctx.svr.state)
+	}
+}
+
+func TestCandidateRecvOtherVote(t *testing.T) {
+	ctx := startup_candidate_test(t)
+	defer teardown_candidate_test(t, ctx)
+	ctx.svr.election_timeout = 3 * time.Second
+	for _, o := range ctx.svr.cluster_info {
+		oo, _ := o.client.(*MockClient)
+		// holy shit
+		oo.ReplaceFunctor(func(id string) func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
+			return func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
+				// mock timeout
+				time.Sleep(3 * time.Second)
+				rsp := new(pb.RequestVoteRes)
+				rsp.Header = new(pb.ResHeader)
+				rsp.Term = req.Term
+				rsp.VoteGranted = id
+				return rsp, nil
+			}
+		}(o.id))
+	}
+	go ctx.svr.Elect()
+	req := new(pb.RequestVoteReq)
+	req.Header = new(pb.ReqHeader)
+	req.Term = 2
+	req.CandidateId = "id1"
+	req.LastLogIndex = -1
+	req.LastLogTerm = -1
+	ctx.svr.vote_pair.input <- req
+	output := <-ctx.svr.vote_pair.output
+	if output.VoteGranted != "id1" || output.Term != 2 {
+		t.Errorf("bad vote result:%v", output)
+		return
+	}
+	time.Sleep(1 * time.Second)
+	if ctx.svr.state != pb.PeerState_Follower {
+		t.Errorf("after success vote, peer should be follower:%v", ctx.svr.state)
+	}
+}
+
+func TestCandidateRecvNewEntry(t *testing.T) {
+	ctx := startup_candidate_test(t)
+	defer teardown_candidate_test(t, ctx)
+	ctx.svr.election_timeout = 3 * time.Second
+	for _, o := range ctx.svr.cluster_info {
+		oo, _ := o.client.(*MockClient)
+		// holy shit
+		oo.ReplaceFunctor(func(id string) func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
+			return func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
+				// mock timeout
+				time.Sleep(3 * time.Second)
+				rsp := new(pb.RequestVoteRes)
+				rsp.Header = new(pb.ResHeader)
+				rsp.Term = req.Term
+				rsp.VoteGranted = id
+				return rsp, nil
+			}
+		}(o.id))
+	}
+	go ctx.svr.Elect()
+	req := new(pb.AppendEntriesReq)
+	req.Header = new(pb.ReqHeader)
+	req.Term = int64(0)
+	req.LeaderId = "id1"
+	req.LeaderCommit = -1
+	req.PrevLogIndex = -1
+	req.PrevLogTerm = -1
+	ctx.svr.new_entry_pair.input <- req
+	output := <-ctx.svr.new_entry_pair.output
+	if output.Result != int32(AE_SMALL_TERM) {
+		t.Errorf("bad entry result:%v", output)
+	}
+	req.Term = int64(1)
+	ctx.svr.new_entry_pair.input <- req
+	output = <-ctx.svr.new_entry_pair.output
+	if output.Result != int32(AE_RETRY) {
+		t.Errorf("bad entry result:%v", output)
 	}
 }

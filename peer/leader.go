@@ -280,7 +280,7 @@ func (p *PeerServer) LeaderCron() {
 		go p.TransLog(o, translog_chan, closer)
 	}
 
-	// TODO(deyukong): we must guarentee that master's term is invariant before the local channels terminates.
+	// NOTE(deyukong): we must guarentee that master's term is invariant before the local channels terminates.
 	// otherwise, the two goroutines will use the true-leader's(other than me) term to send hb or logentries
 	// to followers. which in fact is a byzantine-situation. so we donot change current_term until this loop
 	// exits.

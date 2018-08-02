@@ -86,22 +86,22 @@ func (p *PeerServer) Elect() {
 				return
 			}
 		case tmp := <-p.vote_pair.input:
-			if ok, reason := p.GrantVote(tmp); !ok {
+			ok, reason := p.GrantVote(tmp)
+			if !ok {
 				log.Infof("elect term:%d got vote, now_term:%d not grant:%s", new_term, p.current_term, reason)
-				p.vote_pair.output <- &pb.RequestVoteRes{
-					Header:      new(pb.ResHeader),
-					VoteGranted: p.vote_for,
-					// although vote not granted, it is still guaranteed that if other's term is greater,
-					// ours is also updated to other's
-					Term: p.current_term,
-				}
 			} else {
 				log.Infof("elect term:%d got vote and granted, current_term:%d", new_term, p.current_term)
-				p.vote_pair.output <- &pb.RequestVoteRes{
-					Header:      new(pb.ResHeader),
-					VoteGranted: p.vote_for,
-					Term:        p.current_term,
-				}
+			}
+			p.vote_pair.output <- &pb.RequestVoteRes{
+				Header:      new(pb.ResHeader),
+				VoteGranted: p.vote_for,
+				// no matter vote granted or not, it is still guaranteed that if other's term is greater,
+				// ours is also updated to other's
+				Term: p.current_term,
+			}
+			if p.current_term > new_term {
+				log.Infof("after grantVote, cur_term:%d, old_term:%d, turn follower", p.current_term, new_term)
+				p.ChangeState(pb.PeerState_Follower)
 				return
 			}
 		case <-p.closer.HasBeenClosed():
@@ -183,22 +183,22 @@ WAIT_ELECT_FOR_END:
 					return
 				}
 			case tmp := <-p.vote_pair.input:
-				if ok, reason := p.GrantVote(tmp); !ok {
+				ok, reason := p.GrantVote(tmp)
+				if !ok {
 					log.Infof("elect term:%d got vote, now_term:%d not grant:%s", new_term, p.current_term, reason)
-					p.vote_pair.output <- &pb.RequestVoteRes{
-						Header:      new(pb.ResHeader),
-						VoteGranted: p.vote_for,
-						// although vote not granted, it is still guaranteed that if other's term is greater,
-						// ours is also updated to other's
-						Term: p.current_term,
-					}
 				} else {
 					log.Infof("elect term:%d got vote and granted, current_term:%d", new_term, p.current_term)
-					p.vote_pair.output <- &pb.RequestVoteRes{
-						Header:      new(pb.ResHeader),
-						VoteGranted: p.vote_for,
-						Term:        p.current_term,
-					}
+				}
+				p.vote_pair.output <- &pb.RequestVoteRes{
+					Header:      new(pb.ResHeader),
+					VoteGranted: p.vote_for,
+					// no matter vote granted or not, it is still guaranteed that if other's term is greater,
+					// ours is also updated to other's
+					Term: p.current_term,
+				}
+				if p.current_term > new_term {
+					log.Infof("after grantVote, cur_term:%d, old_term:%d, turn follower", p.current_term, new_term)
+					p.ChangeState(pb.PeerState_Follower)
 					return
 				}
 			case <-p.closer.HasBeenClosed():
