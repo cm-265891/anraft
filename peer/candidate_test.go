@@ -6,30 +6,12 @@ import (
 	"anraft/utils"
 	"fmt"
 	context "golang.org/x/net/context"
-	"google.golang.org/grpc"
+	//"google.golang.org/grpc"
 	"os"
-	"sync"
+	//"sync"
 	"testing"
 	"time"
 )
-
-type MockClient struct {
-	pb.PeerClient
-	mutex        sync.Mutex
-	vote_functor func(context.Context, *pb.RequestVoteReq) (*pb.RequestVoteRes, error)
-}
-
-func (m *MockClient) RequestVote(ctx context.Context, req *pb.RequestVoteReq, opts ...grpc.CallOption) (*pb.RequestVoteRes, error) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	return m.vote_functor(ctx, req)
-}
-
-func (m *MockClient) ReplaceFunctor(f func(context.Context, *pb.RequestVoteReq) (*pb.RequestVoteRes, error)) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	m.vote_functor = f
-}
 
 func startup_candidate_test(t *testing.T) *TestContext {
 	result := &TestContext{}
@@ -69,7 +51,7 @@ func TestCandidateVoteFail(t *testing.T) {
 	defer teardown_candidate_test(t, ctx)
 	for _, o := range ctx.svr.cluster_info {
 		oo, _ := o.client.(*MockClient)
-		oo.ReplaceFunctor(func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
+		oo.ReplaceVoteFunctor(func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
 			rsp := new(pb.RequestVoteRes)
 			rsp.Header = new(pb.ResHeader)
 			rsp.Term = int64(1)
@@ -89,7 +71,7 @@ func TestCandidateVoteSuccess(t *testing.T) {
 	defer teardown_candidate_test(t, ctx)
 	for _, o := range ctx.svr.cluster_info {
 		oo, _ := o.client.(*MockClient)
-		oo.ReplaceFunctor(func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
+		oo.ReplaceVoteFunctor(func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
 			rsp := new(pb.RequestVoteRes)
 			rsp.Header = new(pb.ResHeader)
 			rsp.Term = int64(1)
@@ -110,7 +92,7 @@ func TestCandidateVoteDraw(t *testing.T) {
 	for _, o := range ctx.svr.cluster_info {
 		oo, _ := o.client.(*MockClient)
 		// holy shit
-		oo.ReplaceFunctor(func(id string) func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
+		oo.ReplaceVoteFunctor(func(id string) func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
 			return func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
 				rsp := new(pb.RequestVoteRes)
 				rsp.Header = new(pb.ResHeader)
@@ -134,7 +116,7 @@ func TestCandidateRecvOtherVote(t *testing.T) {
 	for _, o := range ctx.svr.cluster_info {
 		oo, _ := o.client.(*MockClient)
 		// holy shit
-		oo.ReplaceFunctor(func(id string) func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
+		oo.ReplaceVoteFunctor(func(id string) func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
 			return func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
 				// mock timeout
 				time.Sleep(3 * time.Second)
@@ -172,7 +154,7 @@ func TestCandidateRecvNewEntry(t *testing.T) {
 	for _, o := range ctx.svr.cluster_info {
 		oo, _ := o.client.(*MockClient)
 		// holy shit
-		oo.ReplaceFunctor(func(id string) func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
+		oo.ReplaceVoteFunctor(func(id string) func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
 			return func(ctx context.Context, req *pb.RequestVoteReq) (*pb.RequestVoteRes, error) {
 				// mock timeout
 				time.Sleep(3 * time.Second)

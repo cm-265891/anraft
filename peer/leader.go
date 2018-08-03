@@ -54,6 +54,7 @@ func (p *PeerServer) LeaderHeartBeatCron(term_chan chan int64, closer *utils.Clo
 				go heartBeat(o, current_term, p.id, p.commit_index, p.election_interval, hb_chan, &wg)
 			}
 			wg.Wait()
+			close(hb_chan)
 			max_term := current_term
 			// NOTE(deyukong): from the aspect of symmetry, master should stepdown if it does not receive
 			// hb from the majority. but the paper didnt mention it
@@ -293,7 +294,7 @@ func (p *PeerServer) LeaderCron() {
 		go p.TransLog(o, translog_chan, closer)
 	}
 
-	// NOTE(deyukong): we must guarentee that master's term is invariant before the local channels terminates.
+	// NOTE(deyukong): we must guarentee that master's term is invariant before the local channels terminate.
 	// otherwise, the two goroutines will use the true-leader's(other than me) term to send hb or logentries
 	// to followers. which in fact is a byzantine-situation. so we donot change current_term until this loop
 	// exits.

@@ -5,7 +5,7 @@ import (
 	"anraft/storage/badger"
 	"anraft/utils"
 	"fmt"
-	//context "golang.org/x/net/context"
+	context "golang.org/x/net/context"
 	//"google.golang.org/grpc"
 	"os"
 	//"sync"
@@ -110,6 +110,29 @@ func TestForwardCommitIdx(t *testing.T) {
 		})
 	if test_ctx.svr.commit_index != 2 {
 		t.Errorf("commit_index not ok:%v", test_ctx.svr.commit_index)
+		return
+	}
+}
+
+func TestHeartBeat(t *testing.T) {
+	test_ctx := startup_leader_test(t)
+	defer teardown_leader_test(t, test_ctx)
+	for _, o := range test_ctx.svr.cluster_info {
+		oo, _ := o.client.(*MockClient)
+		oo.ReplaceAeFunctor(func(context.Context, *pb.AppendEntriesReq) (*pb.AppendEntriesRes, error) {
+			rsp := new(pb.AppendEntriesRes)
+			rsp.Header = new(pb.ResHeader)
+			rsp.Term = int64(2)
+			rsp.Result = int32(AE_OK)
+			return rsp, nil
+		})
+	}
+	test_ctx.svr.election_timeout = 10 * time.Second
+	go test_ctx.svr.LeaderCron()
+	time.Sleep(1 * time.Second)
+	if test_ctx.svr.state != pb.PeerState_Follower || test_ctx.svr.current_term != int64(2) {
+		t.Errorf("heartbeat greater term should be follower:[%v %v]",
+			test_ctx.svr.state, test_ctx.svr.current_term)
 		return
 	}
 }

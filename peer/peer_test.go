@@ -5,10 +5,47 @@ import (
 	"anraft/storage/badger"
 	"anraft/utils"
 	"fmt"
+	context "golang.org/x/net/context"
+	"google.golang.org/grpc"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
+
+type VoteFunctor func(context.Context, *pb.RequestVoteReq) (*pb.RequestVoteRes, error)
+type AeFunctor func(context.Context, *pb.AppendEntriesReq) (*pb.AppendEntriesRes, error)
+
+type MockClient struct {
+	pb.PeerClient
+	mutex        sync.Mutex
+	vote_functor VoteFunctor
+	ae_functor   AeFunctor
+}
+
+func (m *MockClient) RequestVote(ctx context.Context, req *pb.RequestVoteReq, opts ...grpc.CallOption) (*pb.RequestVoteRes, error) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	return m.vote_functor(ctx, req)
+}
+
+func (m *MockClient) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq, opts ...grpc.CallOption) (*pb.AppendEntriesRes, error) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	return m.ae_functor(ctx, req)
+}
+
+func (m *MockClient) ReplaceVoteFunctor(f VoteFunctor) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.vote_functor = f
+}
+
+func (m *MockClient) ReplaceAeFunctor(f AeFunctor) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.ae_functor = f
+}
 
 func startup_peer_test(t *testing.T) *TestContext {
 	result := &TestContext{}
