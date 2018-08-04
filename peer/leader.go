@@ -59,10 +59,7 @@ func (p *PeerServer) LeaderHeartBeatCron(term_chan chan int64, closer *utils.Clo
 			// NOTE(deyukong): from the aspect of symmetry, master should stepdown if it does not receive
 			// hb from the majority. but the paper didnt mention it
 			for o := range hb_chan {
-				if o.res.Result != int32(AE_OK) {
-					log.Infof("get hb from:%s not ok[%d:%s]", o.id, o.res.Result, o.res.Msg)
-				}
-				if o.res.Term > max_term {
+				if o.res.Result == int32(AE_SMALL_TERM) && o.res.Term > max_term {
 					max_term = o.res.Term
 				}
 			}
@@ -133,18 +130,10 @@ func (p *PeerServer) TransLog(target *PeerInfo, translog_chan chan *AeWrapper, c
 			log.Infof("leader to peer:%s translog stops...", target.host)
 			return
 		case <-time.After(duration):
-			last_entry, err := p.store.GetLastLogEntry()
-			if err != nil {
-				log.Fatalf("GetLastLogEntry failed:%v", err)
-			}
-			if last_entry == nil || last_entry.Index < next_idx {
-				// no new entries, we keep waiting, donot reduce wait-duration
-				break
-			}
+			// refer to the paper, after leader powers up, next_idx is set to last_idx + 1
+			// we should keep a hb-like process to reduce last_idx to the correct position
+			// so here, even we have no data to send(entries == NULL), we still hb to followers.
 			entries := p.getLogBatch(next_idx, batchsize)
-			if len(entries) == 0 {
-				log.Fatalf("BUG:entries to send shouldnt be empty")
-			}
 			prev_idx, prev_term := p.getPrevLogIdxAndTerm(next_idx)
 
 			req := new(pb.AppendEntriesReq)
@@ -161,15 +150,30 @@ func (p *PeerServer) TransLog(target *PeerInfo, translog_chan chan *AeWrapper, c
 			ctx, _ := context.WithTimeout(context.Background(), time.Duration(100)*time.Millisecond)
 			rsp, err := target.client.AppendEntries(ctx, req)
 			if err != nil {
-				log.Warnf("apply entries:%d to %s failed:%v", len(entries), p.host, err)
+				log.Warnf("apply entries:%d to %s failed:%v", len(entries), target.host, err)
 				break
 			}
+
+			ae_wrapper := &AeWrapper{
+				id:  target.id,
+				res: rsp,
+				it: &IndexAndTerm{
+					idx:  -1,
+					term: -1,
+				},
+			}
 			if rsp.Result == int32(AE_OK) {
-				batch_end_idx := entries[len(entries)-1].Index
-				if batch_end_idx < match_idx {
-					log.Fatalf("peer:%s batch:%d smaller than match_idx:%d", p.host, batch_end_idx, match_idx)
+				ae_wrapper.it.idx = req.PrevLogIndex
+				ae_wrapper.it.term = req.PrevLogTerm
+				if len(entries) != 0 {
+					ae_wrapper.it.idx = entries[len(entries)-1].Index
+					ae_wrapper.it.idx = entries[len(entries)-1].Term
 				}
-				match_idx = batch_end_idx
+				if ae_wrapper.it.idx < match_idx {
+					log.Fatalf("BUG! peer:%s batch:%d smaller than match_idx:%d",
+						target.host, ae_wrapper.it.idx, match_idx)
+				}
+				match_idx = ae_wrapper.it.idx
 				next_idx = match_idx + 1
 				if len(entries) == batchsize {
 					duration = time.Duration(0) * time.Millisecond
@@ -178,34 +182,22 @@ func (p *PeerServer) TransLog(target *PeerInfo, translog_chan chan *AeWrapper, c
 				}
 			} else if rsp.Result == int32(AE_TERM_UNMATCH) {
 				if next_idx == 0 {
-					log.Fatalf("peer:%s unmatch but we have reached the beginning", p.host)
+					log.Fatalf("peer:%s unmatch but we have reached the beginning", target.host)
 				} else {
 					// TODO(deyukong): too slow to find the common point, optimize
 					next_idx -= 1
 					if next_idx <= match_idx {
-						log.Fatalf("peer:%s unmatch before match_idx:%d", p.host, match_idx)
+						log.Fatalf("peer:%s unmatch before match_idx:%d", target.host, match_idx)
 					} else {
-						log.Warnf("peer:%s nextidx:%d backoff by one", p.host, next_idx)
+						log.Warnf("peer:%s nextidx:%d backoff by one", target.host, next_idx)
 					}
 				}
 			} else if rsp.Result == int32(AE_RETRY) {
-				log.Fatalf("peer:%s reply AE_RETRY", p.host)
+				log.Fatalf("peer:%s reply AE_RETRY", target.host)
 			} else if rsp.Result == int32(AE_SMALL_TERM) {
 				// nothing
 			}
-			tmp := &AeWrapper{
-				id:  p.host,
-				res: rsp,
-				it: &IndexAndTerm{
-					idx:  -1,
-					term: -1,
-				},
-			}
-			if rsp.Result == int32(AE_OK) {
-				tmp.it.idx = entries[len(entries)-1].Index
-				tmp.it.term = entries[len(entries)-1].Term
-			}
-			translog_chan <- tmp
+			translog_chan <- ae_wrapper
 		}
 	}
 }
@@ -232,6 +224,7 @@ func (c *CommitForwarder) String() string {
 }
 
 func (p *PeerServer) ForwardCommitIndex(fwder *CommitForwarder, ae *AeWrapper) {
+	log.Debugf("ForwardCommitIndex fwder:%v, ae:%v", fwder, ae)
 	last_entry, err := p.store.GetLastLogEntry()
 	if err != nil {
 		log.Fatalf("GetLastLogEntry failed:%v", err)
@@ -241,7 +234,7 @@ func (p *PeerServer) ForwardCommitIndex(fwder *CommitForwarder, ae *AeWrapper) {
 	}
 	it := fwder.followers[ae.id]
 	if it.idx > ae.it.idx {
-		log.Fatalf("BUG peer:%s log backtraces!", ae.id)
+		log.Fatalf("BUG peer:%s log backtraces[%d,%d]!", ae.id, it.idx, ae.it.idx)
 	}
 	it.idx = ae.it.idx
 	it.term = ae.it.term
@@ -276,7 +269,7 @@ func (p *PeerServer) ForwardCommitIndex(fwder *CommitForwarder, ae *AeWrapper) {
 	p.UpdateCommitIndex(its[majority_pos].idx)
 }
 
-func (p *PeerServer) LeaderCron() {
+func (p *PeerServer) LeaderCron(run_flag LeaderMode) {
 	// init local variables
 	hb_term_chan := make(chan int64)
 	closer := utils.NewCloser()
@@ -286,14 +279,18 @@ func (p *PeerServer) LeaderCron() {
 	commit_fwder := &CommitForwarder{}
 	commit_fwder.Init(p.cluster_info, p.id)
 
-	closer.AddOne()
-	go p.LeaderHeartBeatCron(hb_term_chan, closer)
-
-	for _, o := range p.cluster_info {
+	if run_flag.IsHB() {
 		closer.AddOne()
-		go p.TransLog(o, translog_chan, closer)
+		go p.LeaderHeartBeatCron(hb_term_chan, closer)
 	}
-
+	if run_flag.IsTL() {
+		for _, o := range p.cluster_info {
+			if o.id != p.id {
+				closer.AddOne()
+				go p.TransLog(o, translog_chan, closer)
+			}
+		}
+	}
 	// NOTE(deyukong): we must guarentee that master's term is invariant before the local channels terminate.
 	// otherwise, the two goroutines will use the true-leader's(other than me) term to send hb or logentries
 	// to followers. which in fact is a byzantine-situation. so we donot change current_term until this loop
@@ -309,6 +306,8 @@ func (p *PeerServer) LeaderCron() {
 			select {
 			case tmp := <-hb_term_chan:
 				log.Infof("ignore msg:%d from hb_term_chan since master stepping down", tmp)
+			case tmp := <-translog_chan:
+				log.Infof("ignore msg:%v from translog_chan since master stepping down", tmp)
 			case <-closer.CloseCompleted():
 				log.Infof("hb channel and translog channels are all closed, leader stepdown finish")
 				if new_term > p.current_term {
@@ -346,7 +345,7 @@ func (p *PeerServer) LeaderCron() {
 				}
 				new_term = tmp.res.Term
 				return
-			} else {
+			} else if tmp.res.Result == int32(AE_OK) {
 				log.Debugf("leader term:%d got[%s] hb:%d smaller", p.current_term, tmp.id, tmp.res.Term)
 				p.ForwardCommitIndex(commit_fwder, tmp)
 			}

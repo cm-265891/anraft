@@ -50,6 +50,22 @@ const (
 	AE_TERM_UNMATCH
 )
 
+type LeaderMode int
+
+const (
+	LM_NO_CRON LeaderMode = 1 << iota
+	LM_HB                 // leader mode heartbeat
+	LM_TL                 // leader mode translog
+)
+
+func (l LeaderMode) IsHB() bool {
+	return (l & LM_HB) != 0
+}
+
+func (l LeaderMode) IsTL() bool {
+	return (l & LM_TL) != 0
+}
+
 const (
 	LAG_MAX = 1000
 )
@@ -216,7 +232,7 @@ func (p *PeerServer) RoleManageThd() {
 		if p.state == pb.PeerState_Follower {
 			p.FollowerCron()
 		} else if p.state == pb.PeerState_Leader {
-			p.LeaderCron()
+			p.LeaderCron(LM_HB | LM_TL)
 		} else if p.state == pb.PeerState_Candidate {
 			log.Fatalf("candidate state, code should not reach here")
 		} else {

@@ -123,16 +123,61 @@ func TestHeartBeat(t *testing.T) {
 			rsp := new(pb.AppendEntriesRes)
 			rsp.Header = new(pb.ResHeader)
 			rsp.Term = int64(2)
-			rsp.Result = int32(AE_OK)
+			rsp.Result = int32(AE_SMALL_TERM)
 			return rsp, nil
 		})
 	}
 	test_ctx.svr.election_timeout = 10 * time.Second
-	go test_ctx.svr.LeaderCron()
+	go test_ctx.svr.LeaderCron(LM_HB)
 	time.Sleep(1 * time.Second)
 	if test_ctx.svr.state != pb.PeerState_Follower || test_ctx.svr.current_term != int64(2) {
 		t.Errorf("heartbeat greater term should be follower:[%v %v]",
 			test_ctx.svr.state, test_ctx.svr.current_term)
+		return
+	}
+}
+
+func TestTransLogOK(t *testing.T) {
+	test_ctx := startup_leader_test(t)
+	defer teardown_leader_test(t, test_ctx)
+	for _, o := range test_ctx.svr.cluster_info {
+		oo, _ := o.client.(*MockClient)
+		oo.ReplaceAeFunctor(func(ctx context.Context, req *pb.AppendEntriesReq) (*pb.AppendEntriesRes, error) {
+			rsp := new(pb.AppendEntriesRes)
+			rsp.Header = new(pb.ResHeader)
+			rsp.Term = req.Term
+			rsp.Result = int32(AE_OK)
+			return rsp, nil
+		})
+	}
+
+	if ok := test_ctx.svr.UpdateTerm(1); !ok {
+		t.Errorf("UpdateTerm failed")
+		return
+	}
+	if err := test_ctx.svr.store.AppendLogEntry(&pb.LogEntry{
+		Index: 1,
+		Term:  1,
+		Key:   "a",
+		Value: []byte("a"),
+	}); err != nil {
+		t.Errorf("append entry 1 failed:%v", err)
+	}
+	if err := test_ctx.svr.store.AppendLogEntry(&pb.LogEntry{
+		Index: 2,
+		Term:  1,
+		Key:   "a",
+		Value: []byte("a"),
+	}); err != nil {
+		t.Errorf("append entry 1 failed:%v", err)
+	}
+
+	test_ctx.svr.election_timeout = 10 * time.Second
+	test_ctx.svr.state = pb.PeerState_Leader
+	go test_ctx.svr.LeaderCron(LM_TL)
+	time.Sleep(1 * time.Second)
+	if test_ctx.svr.state != pb.PeerState_Leader || test_ctx.svr.commit_index != int64(2) {
+		t.Errorf("invalid translog state:%v %d", test_ctx.svr.state, test_ctx.svr.commit_index)
 		return
 	}
 }

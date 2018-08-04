@@ -73,7 +73,10 @@ func (p *PeerServer) appendNewEntries(entries *pb.AppendEntriesReq) *pb.AppendEn
 	}
 
 	p.UpdateTerm(entries.Term)
-	if len(entries.Entries) == 0 {
+
+	// NOTE(deyukong): let hb returns early, leader's hb and translog are two threads, hb and translog
+	// rpc's term may not be monotonic
+	if len(entries.Entries) == 0 && entries.PrevLogIndex == -1 && entries.PrevLogTerm == -1 {
 		// heartbeat
 		return &pb.AppendEntriesRes{
 			Header: new(pb.ResHeader),
