@@ -3,7 +3,6 @@ syntax = "proto3";
 package peer_proto;
 
 service Peer {
-    rpc HeartBeat(HeartBeatReq) returns (HeartBeatRes);
     rpc RequestVote(RequestVoteReq) returns (RequestVoteRes);
     rpc AppendEntries(AppendEntriesReq) returns (AppendEntriesRes);
 }
@@ -25,14 +24,6 @@ message ResHeader {
     string ret_msg = 4;
 }
 
-message HeartBeatReq {
-    ReqHeader header = 1;
-}
-
-message HeartBeatRes {
-    ResHeader header = 1;
-}
-
 message RequestVoteReq {
     ReqHeader header = 1;
     int64 term = 2;
@@ -47,11 +38,17 @@ message RequestVoteRes {
     string vote_granted = 3;
 }
 
+enum LogOp {
+    Set = 0;
+    Del = 1;
+}
+
 message LogEntry {
     int64 index = 1;
     int64 term = 2;
-    string key = 3;
-    bytes value = 4;
+    LogOp op = 3;
+    string key = 4;
+    bytes value = 5;
 }
 
 message AppendEntriesReq {

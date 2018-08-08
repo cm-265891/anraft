@@ -3,6 +3,7 @@ package main
 import (
 	"anraft/peer"
 	"anraft/proto/peer_proto"
+    "anraft/proto/server_proto"
 	"anraft/storage/badger"
 	"anraft/utils"
 	"flag"
@@ -24,7 +25,7 @@ configfile is a yaml file, refer to the example below:
 logLevel: debug
 logPath: ./log
 peer:
-    host: 10.172.12.31
+    host: 10.172.12.31:30000
     id: raft0
     cluster:
         raft0/10.172.12.31
@@ -32,6 +33,8 @@ peer:
         raft2/10.172.12.33
         raft3/10.172.12.34
         raft4/10.172.12.35
+server:
+    host: 10.172.12.31:30001
 `
 
 var configFile = flag.String("conf", "conf/peer.conf", configExample)
@@ -76,10 +79,16 @@ func Main() error {
 	log.SetHighlighting(false)
 	log.SetOutputByName(fmt.Sprintf("%s/peer.log", logPath))
 
-	host := utils.GetConfigStringOrDefault("peer:host", "")
-	if host == "" {
-		log.Errorf("host not configured")
-		return fmt.Errorf("host not configured")
+	peer_host := utils.GetConfigStringOrDefault("peer:host", "")
+	if peer_host == "" {
+		log.Errorf("peer_host not configured")
+		return fmt.Errorf("peer_host not configured")
+	}
+
+    server_host := utils.GetConfigStringOrDefault("server:host", "")
+	if server_host == "" {
+		log.Errorf("server_host not configured")
+		return fmt.Errorf("server_host not configured")
 	}
 
 	id := utils.GetConfigStringOrDefault("peer:id", "")
@@ -122,7 +131,7 @@ func Main() error {
 	elect_timeout := utils.GetConfigIntOrDefault("raftlog:election_timeout_ms", 500)
 	elect_timeout_dur := time.Duration(elect_timeout) * time.Millisecond
 
-	listener, err1 := net.Listen("tcp", host)
+	peer_listener, err1 := net.Listen("tcp", peer_host)
 	if err1 != nil {
 		log.Errorf("listen failed: %v", err1)
 		return err1
@@ -131,13 +140,14 @@ func Main() error {
 	grpc_svr := grpc.NewServer(opts...)
 
 	peer_svr := &peer.PeerServer{}
-	if err := peer_svr.Init(id, host, cluster_map, engine, elect_timeout_dur); err != nil {
+	if err := peer_svr.Init(id, cluster_map, engine, elect_timeout_dur); err != nil {
 		log.Errorf("peer server init failed:%v", err)
 		return err
 	}
 	peer_proto.RegisterPeerServer(grpc_svr, peer_svr)
+    server_proto.RegisterServerServer(grpc_svr, peer_svr)
     peer_svr.Start()
-	go grpc_svr.Serve(listener)
+	go grpc_svr.Serve(peer_listener)
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc,
 		syscall.SIGINT,

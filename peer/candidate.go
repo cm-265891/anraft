@@ -47,7 +47,7 @@ func (p *PeerServer) Elect() {
 		log.Fatalf("get last entry failed:%v", err)
 	}
 	for _, o := range p.cluster_info {
-		if o.host == p.host {
+		if o.id == p.id {
 			continue
 		}
 		wg.Add(1)
@@ -134,7 +134,7 @@ WAIT_ELECT_FOR_END:
 	// update currentTerm to T and conver to follower
 	if max_term > new_term {
 		p.UpdateTerm(max_term)
-		p.state = pb.PeerState_Follower
+		p.ChangeState(pb.PeerState_Follower)
 		return
 	}
 

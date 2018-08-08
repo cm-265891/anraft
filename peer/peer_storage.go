@@ -22,11 +22,13 @@ const (
 	CURRENT_TERM = "CURRENT_TERM"
 	VOTE_FOR     = "VOTE_FOR"
 	COMMIT_IDX   = "COMMIT_IDX"
+	COMMIT_APPLY = "COMMIT_APPLY"
 )
 
 var (
 	LOG_PREFIX = []byte(fmt.Sprintf("%03d|", LOG))
 	LOG_END    = []byte(fmt.Sprintf("%03d|%021d", LOG, math.MaxInt64))
+	KV_PREFIX  = []byte(fmt.Sprintf("%03d|", KV))
 )
 
 // TODO(deyukong): classify all the store apis, which needs durable, which does not
@@ -57,6 +59,21 @@ func (p *PeerStorage) Init(engine storage.Storage) {
 			}
 		}
 	}
+}
+
+func (p *PeerStorage) GetKV(key string) ([]byte, error) {
+	key = fmt.Sprintf("%03d|%s", KV, key)
+	return p.engine.Get([]byte(key))
+}
+
+func (p *PeerStorage) SetKV(key string, val []byte) error {
+	key = fmt.Sprintf("%03d|%s", KV, key)
+	return p.engine.Set([]byte(key), val)
+}
+
+func (p *PeerStorage) DelKV(key string) error {
+	key = fmt.Sprintf("%03d|%s", KV, key)
+	return p.engine.Del([]byte(key))
 }
 
 // NOTE(deyukong): It's confusion to handle endians, so I convert nums to strings with preceding zeros
@@ -91,6 +108,23 @@ func (p *PeerStorage) GetVoteFor() (string, error) {
 	}
 }
 
+func (p *PeerStorage) SaveCommitApply(idx int64) error {
+	key := fmt.Sprintf("%03d|%s", META, COMMIT_APPLY)
+	val := fmt.Sprintf("%d", idx)
+	return p.engine.Set([]byte(key), []byte(val))
+}
+
+func (p *PeerStorage) GetCommitApply() (int64, error) {
+	key := fmt.Sprintf("%03d|%s", META, COMMIT_APPLY)
+	if bytes, err := p.engine.Get([]byte(key)); err != nil {
+		return 0, err
+	} else if idx, err := strconv.ParseInt(string(bytes), 10, 64); err != nil {
+		return 0, err
+	} else {
+		return idx, nil
+	}
+}
+
 func (p *PeerStorage) SaveCommitIndex(idx int64) error {
 	key := fmt.Sprintf("%03d|%s", META, COMMIT_IDX)
 	val := fmt.Sprintf("%d", idx)
@@ -101,10 +135,10 @@ func (p *PeerStorage) GetCommitIndex() (int64, error) {
 	key := fmt.Sprintf("%03d|%s", META, COMMIT_IDX)
 	if bytes, err := p.engine.Get([]byte(key)); err != nil {
 		return 0, err
-	} else if term, err := strconv.ParseInt(string(bytes), 10, 64); err != nil {
+	} else if idx, err := strconv.ParseInt(string(bytes), 10, 64); err != nil {
 		return 0, err
 	} else {
-		return term, nil
+		return idx, nil
 	}
 }
 

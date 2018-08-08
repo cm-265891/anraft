@@ -47,7 +47,7 @@ func (p *PeerServer) LeaderHeartBeatCron(term_chan chan int64, closer *utils.Clo
 			hb_chan := make(chan *AeWrapper, len(p.cluster_info)-1)
 			var wg sync.WaitGroup
 			for _, o := range p.cluster_info {
-				if o.host == p.host {
+				if o.id == p.id {
 					continue
 				}
 				wg.Add(1)

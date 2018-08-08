@@ -142,16 +142,17 @@ func (p *PeerInfo) Init(id string, host string) error {
 }
 
 type PeerServer struct {
-	host         string
 	id           string
 	cluster_info []*PeerInfo
-	mutex        sync.Mutex
+	mutex        sync.RWMutex
+	commit_cond  *sync.Cond
 	// in-mem cache of the in-disk persistent term, protected by mutex
 	current_term int64
 	// in-mem cache of the in-disk persistent vote_for, protected by mutex
 	vote_for string
 	// in-mem cache of the persist commit-index
-	commit_index   int64
+	commit_index int64
+	// current state, protected by mutex
 	state          pb.PeerState
 	store          *PeerStorage
 	new_entry_pair *NewEntryPair
@@ -162,14 +163,15 @@ type PeerServer struct {
 	/* called the election timeout, then ...... */
 	election_timeout  time.Duration
 	election_interval time.Duration
+	volatile_leader   string
+	statm             *StateMachine
 }
 
-func (p *PeerServer) Init(my_id, my_host string, hosts map[string]string,
+func (p *PeerServer) Init(my_id string, hosts map[string]string,
 	store_engine storage.Storage, etime time.Duration) error {
 	if _, ok := hosts[my_id]; !ok {
 		return fmt.Errorf("self should be in cluster")
 	}
-	p.host = my_host
 	p.id = my_id
 	p.cluster_info = []*PeerInfo{}
 	for id, host := range hosts {
@@ -191,8 +193,13 @@ func (p *PeerServer) Init(my_id, my_host string, hosts map[string]string,
 		output: make(chan *pb.RequestVoteRes),
 	}
 	p.closer = utils.NewCloser()
+	p.commit_cond = sync.NewCond(&p.mutex)
+
 	p.store = &PeerStorage{}
 	p.store.Init(store_engine)
+
+	p.statm = &StateMachine{}
+	p.statm.Init(p, p.store, p.closer)
 
 	var err error = nil
 	if p.current_term, err = p.store.GetTerm(); err != nil {
@@ -212,10 +219,8 @@ func (p *PeerServer) Init(my_id, my_host string, hosts map[string]string,
 func (p *PeerServer) Start() {
 	p.closer.AddOne()
 	go p.RoleManageThd()
-}
 
-func (p *PeerServer) HeartBeat(context.Context, *pb.HeartBeatReq) (*pb.HeartBeatRes, error) {
-	return nil, nil
+	p.statm.Run()
 }
 
 // NOTE(deyukong): to make the thread model simple, we only allow RoleManageThd thread to change
@@ -319,8 +324,8 @@ func (p *PeerServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq
 }
 
 func (p *PeerServer) GetCommitIndex() int64 {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
 	return p.commit_index
 }
 
@@ -340,6 +345,7 @@ func (p *PeerServer) UpdateCommitIndex(idx int64) {
 		log.Fatalf("SaveCommitIndex:%d failed:%v", idx, err)
 	}
 	p.commit_index = idx
+	p.commit_cond.Broadcast()
 }
 
 // NOTE(deyukong): can only be called from main thread
@@ -385,14 +391,14 @@ func (p *PeerServer) UpdateTerm(term int64) bool {
 
 // used for user-interactive thread, protected by mutex
 func (p *PeerServer) GetTerm() int64 {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
 	return p.current_term
 }
 
 func (p *PeerServer) GetTermAndVoteFor() (int64, string) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
 	return p.current_term, p.vote_for
 }
 
@@ -405,9 +411,40 @@ func (p *PeerServer) getStateInLock() pb.PeerState {
 }
 
 func (p *PeerServer) GetState() pb.PeerState {
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
+	return p.getStateInLock()
+}
+
+func (p *PeerServer) WaitCommitApply(idx int64, term int64) error {
+	p.statm.WaitCommitApply(idx)
+
+	// NOTE(deyukong): it may not be so precise to compare current_term and my want term
+	// but it wont harm correctness. we dont want to do an IO to get idx's logentry in a mutex
+	// if p.current_term != term, leader-change may happens during a write and upper-level
+	// can do a retry.
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	return p.getStateInLock()
+	if p.current_term != term {
+		return fmt.Errorf("leader changes during wait[%d,%d]", p.current_term, term)
+	}
+	return nil
+}
+
+func (p *PeerServer) WaitCommit(idx int64, term int64) error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	for p.commit_index < idx {
+		p.commit_cond.Wait()
+	}
+	// NOTE(deyukong): it may not be so precise to compare current_term and my want term
+	// but it wont harm correctness. we dont want to do an IO to get idx's logentry in a mutex
+	// if p.current_term != term, leader-change may happens during a write and upper-level
+	// can do a retry.
+	if p.current_term != term {
+		return fmt.Errorf("leader changes during wait[%d,%d]", p.current_term, term)
+	}
+	return nil
 }
 
 func (p *PeerServer) ChangeState(s pb.PeerState) {
